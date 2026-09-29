@@ -1,0 +1,212 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""Secrets prompt for openvpn3 NetworkManager connections.
+
+Speaks the NetworkManager auth-dialog protocol: connection data and known
+secrets arrive on stdin. In --external-ui-mode the prompt is described as a
+key file on stdout and GNOME Shell renders it; otherwise a small GTK 4
+dialog asks and the secrets are written to stdout as key/value lines.
+"""
+
+import argparse
+import base64
+import binascii
+import os
+import sys
+import time
+
+import gi
+
+gi.require_version("NM", "1.0")
+from gi.repository import GLib, NM  # noqa: E402
+
+KEY_PASSWORD = "password"
+KEY_CHALLENGE = "challenge-response"
+HINT_MESSAGE = "x-vpn-message:"
+HINT_CHALLENGE_ECHO = "x-challenge-echo"
+
+
+def needs_user_pass(profile_b64):
+    try:
+        config = base64.b64decode(profile_b64 or "", validate=True).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError):
+        return True  # cannot tell: ask rather than fail silently
+    return any(line.strip() == "auth-user-pass" for line in config.splitlines())
+
+
+def password_flags(data):
+    try:
+        return NM.SettingSecretFlags(int(data.get(KEY_PASSWORD + "-flags", "0")))
+    except ValueError:
+        return NM.SettingSecretFlags.NONE
+
+
+def read_vpn_details(stream):
+    """Parses the connection data and secrets NetworkManager writes to stdin.
+
+    NM.VpnServicePlugin.read_vpn_details() is unusable from Python: its
+    hash tables come back without element types.
+    """
+    data, secrets, key = {}, {}, None
+    for raw in iter(stream.readline, b""):
+        line = raw.decode("utf-8").rstrip("\n")
+        if line == "DONE":
+            return data, secrets
+        if line.startswith(("DATA_KEY=", "SECRET_KEY=")):
+            key = line.split("=", 1)[1]
+        elif line.startswith("DATA_VAL=") and key is not None:
+            data[key], key = line[len("DATA_VAL="):], None
+        elif line.startswith("SECRET_VAL=") and key is not None:
+            secrets[key], key = line[len("SECRET_VAL="):], None
+    raise ValueError("unexpected end of input before DONE")
+
+
+class Field:
+    """One prompt entry. Every field is a secret; echo only controls visibility."""
+
+    def __init__(self, key, label, value, should_ask, echo=False):
+        self.key, self.label, self.echo = key, label, echo
+        self.value, self.should_ask = value, should_ask
+
+
+def plan(data, secrets, hints, retry):
+    """Decide which fields to show. Returns (message, fields)."""
+    message = next((h[len(HINT_MESSAGE):] for h in hints if h.startswith(HINT_MESSAGE)), None)
+    if KEY_CHALLENGE in hints:
+        echo = HINT_CHALLENGE_ECHO in hints
+        return message, [Field(KEY_CHALLENGE, message or "Response", "", True, echo=echo)]
+
+    fields = []
+    flags = password_flags(data)
+    if needs_user_pass(data.get("profile")) and not flags & NM.SettingSecretFlags.NOT_REQUIRED:
+        existing = secrets.get(KEY_PASSWORD, "")
+        ask = retry or not existing or bool(flags & NM.SettingSecretFlags.NOT_SAVED)
+        fields.append(Field(KEY_PASSWORD, "Password", existing, ask))
+    return message, fields
+
+
+def external_ui(name, message, fields):
+    kf = GLib.KeyFile()
+    group = "VPN Plugin UI"
+    kf.set_integer(group, "Version", 2)
+    kf.set_string(group, "Description",
+                  message or f"You need to authenticate to access the Virtual Private Network “{name}”.")
+    kf.set_string(group, "Title", "Authenticate VPN")
+    for f in fields:
+        kf.set_string(f.key, "Value", f.value or "")
+        kf.set_string(f.key, "Label", f.label)
+        # Agents skip entries that are not secrets; a visible one-time code
+        # is still a secret, only echoed.
+        kf.set_boolean(f.key, "IsSecret", True)
+        kf.set_boolean(f.key, "ShouldAsk", f.should_ask)
+        kf.set_boolean(f.key, "ForceEcho", f.echo)
+    data, _len = kf.to_data()
+    sys.stdout.write(data)
+    sys.stdout.flush()
+
+
+def gtk_prompt(name, message, fields):
+    """Returns {key: value} or None when cancelled."""
+    gi.require_version("Gtk", "4.0")
+    from gi.repository import Gtk
+
+    result = {}
+    loop = GLib.MainLoop()
+    win = Gtk.Window(title="Authenticate VPN", modal=True, resizable=False)
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
+                  margin_top=18, margin_bottom=18, margin_start=18, margin_end=18)
+    win.set_child(box)
+    box.append(Gtk.Label(label=message or f"Authentication required for “{name}”.",
+                         wrap=True, xalign=0))
+    entries = {}
+    for f in fields:
+        if not f.should_ask:
+            continue
+        box.append(Gtk.Label(label=f.label, xalign=0))
+        e = Gtk.Entry(visibility=f.echo, activates_default=True)
+        e.set_text(f.value or "")
+        box.append(e)
+        entries[f.key] = e
+    buttons = Gtk.Box(spacing=6, halign=Gtk.Align.END)
+    cancel = Gtk.Button(label="Cancel")
+    ok = Gtk.Button(label="Connect")
+    ok.add_css_class("suggested-action")
+    buttons.append(cancel)
+    buttons.append(ok)
+    box.append(buttons)
+    win.set_default_widget(ok)
+
+    def done(accepted):
+        if accepted:
+            result.update({k: e.get_text() for k, e in entries.items()})
+        else:
+            result.clear()
+            result[None] = True
+        win.destroy()
+        loop.quit()
+
+    ok.connect("clicked", lambda *_: done(True))
+    cancel.connect("clicked", lambda *_: done(False))
+    win.connect("close-request", lambda *_: done(False) or True)
+    win.present()
+    loop.run()
+    return None if None in result else result
+
+
+def wait_for_quit():
+    """NetworkManager writes QUIT once it has read the secrets."""
+    os.set_blocking(0, False)
+    buf, deadline = b"", time.monotonic() + 20
+    while time.monotonic() < deadline:
+        try:
+            chunk = os.read(0, 16)
+        except BlockingIOError:
+            time.sleep(0.1)
+            continue
+        if not chunk:
+            time.sleep(0.1)
+            continue
+        buf += chunk
+        if b"QUIT" in buf or len(buf) > 10:
+            return
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("-u", "--uuid", required=True)
+    p.add_argument("-n", "--name", required=True)
+    p.add_argument("-s", "--service", required=True)
+    p.add_argument("-i", "--allow-interaction", action="store_true")
+    p.add_argument("-r", "--reprompt", action="store_true")
+    p.add_argument("-t", "--hint", action="append", default=[])
+    p.add_argument("--external-ui-mode", action="store_true")
+    args = p.parse_args()
+
+    try:
+        data, secrets = read_vpn_details(sys.stdin.buffer)
+    except (ValueError, UnicodeDecodeError) as e:
+        sys.exit(f"Failed to read '{args.name}' ({args.uuid}) data and secrets from stdin: {e}")
+
+    message, fields = plan(data, secrets, args.hint, args.reprompt)
+
+    if args.external_ui_mode:
+        external_ui(args.name, message, fields)
+        return
+
+    values = {f.key: f.value for f in fields if f.value}
+    if any(f.should_ask for f in fields):
+        if not args.allow_interaction:
+            sys.exit(1)
+        answer = gtk_prompt(args.name, message, fields)
+        if answer is None:
+            sys.exit(1)
+        values.update(answer)
+    for k, v in values.items():
+        sys.stdout.write(f"{k}\n{v}\n")
+    sys.stdout.write("\n\n")
+    sys.stdout.flush()
+    wait_for_quit()
+
+
+if __name__ == "__main__":
+    main()

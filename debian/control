@@ -1,0 +1,56 @@
+Source: network-manager-openvpn3
+Section: net
+Priority: optional
+Maintainer: AlexeySetevoi <17676189+AlexeySetevoi@users.noreply.github.com>
+Build-Depends: debhelper-compat (= 13),
+               meson,
+               pkgconf,
+               libnm-dev,
+               libnma-gtk4-dev,
+               libgtk-4-dev,
+               libglib2.0-dev,
+               python3:any,
+               python3-gi <!nocheck>,
+               python3-pytest <!nocheck>,
+               gir1.2-nm-1.0 <!nocheck>
+Standards-Version: 4.7.0
+Homepage: https://github.com/AlexeySetevoi/network-manager-openvpn3
+Vcs-Browser: https://github.com/AlexeySetevoi/network-manager-openvpn3
+Vcs-Git: https://github.com/AlexeySetevoi/network-manager-openvpn3.git
+Rules-Requires-Root: no
+
+Package: network-manager-openvpn3
+Architecture: any
+Depends: ${shlibs:Depends},
+         ${misc:Depends},
+         network-manager (>= 1.42),
+         openvpn3-client | openvpn3,
+         python3,
+         python3-gi,
+         gir1.2-nm-1.0,
+         iproute2
+Recommends: gir1.2-gtk-4.0
+Suggests: network-manager-openvpn3-gnome
+Description: network management framework (OpenVPN 3 plugin core)
+ NetworkManager is a system network service that manages your network
+ devices and connections. This package lets NetworkManager start and
+ stop VPN connections through the OpenVPN 3 Linux client (openvpn3),
+ so openvpn3 profiles show up in the desktop's standard VPN menu and in
+ nmcli.
+ .
+ This package contains the NetworkManager service, the libnm plugin
+ used by nmcli to import and export OpenVPN profiles and the dialog that
+ asks for passwords and one-time codes.
+
+Package: network-manager-openvpn3-gnome
+Architecture: any
+Depends: ${shlibs:Depends},
+         ${misc:Depends},
+         network-manager-openvpn3 (= ${binary:Version})
+Description: network management framework (OpenVPN 3 plugin GNOME GUI)
+ NetworkManager is a system network service that manages your network
+ devices and connections. This package lets NetworkManager start and
+ stop VPN connections through the OpenVPN 3 Linux client (openvpn3).
+ .
+ This package contains the GTK 4 editor used by GNOME Settings to create
+ and edit OpenVPN 3 connections.

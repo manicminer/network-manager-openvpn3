@@ -1,0 +1,36 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""NetworkManager VPN service for OpenVPN 3 Linux. Started by NetworkManager."""
+
+import argparse
+import logging
+import sys
+
+sys.path.insert(0, "@pkgdatadir@")
+
+import gi  # noqa: E402
+
+gi.require_version("NM", "1.0")
+from gi.repository import GLib  # noqa: E402
+
+from nm_openvpn3.service import SERVICE_NAME, Plugin  # noqa: E402
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--bus-name", default=SERVICE_NAME)
+    parser.add_argument("--persist", action="store_true",
+                        help="keep running when NetworkManager goes away")
+    parser.add_argument("--debug", action="store_true")
+    args = parser.parse_args()
+
+    logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO,
+                        format="nm-openvpn3[%(process)d]: %(levelname)s %(message)s")
+
+    loop = GLib.MainLoop()
+    Plugin(args.bus_name, loop, watch_peer=not args.persist)
+    loop.run()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,6 @@
+usr/lib/NetworkManager/VPN/nm-openvpn3-service.name
+usr/lib/*/NetworkManager/libnm-vpn-plugin-openvpn3.so
+usr/libexec/nm-openvpn3-service
+usr/libexec/nm-openvpn3-auth-dialog
+usr/share/dbus-1/system.d/nm-openvpn3-service.conf
+usr/share/network-manager-openvpn3

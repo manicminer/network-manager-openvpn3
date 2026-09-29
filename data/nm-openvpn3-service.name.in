@@ -1,0 +1,13 @@
+[VPN Connection]
+name=openvpn3
+service=org.freedesktop.NetworkManager.openvpn3
+program=@libexecdir@/nm-openvpn3-service
+supports-multiple-connections=true
+
+[libnm]
+plugin=libnm-vpn-plugin-openvpn3.so
+
+[GNOME]
+auth-dialog=@libexecdir@/nm-openvpn3-auth-dialog
+supports-external-ui-mode=true
+supports-hints=true

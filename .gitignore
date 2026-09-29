@@ -1,0 +1,15 @@
+/build/
+/_build/
+__pycache__/
+*.pyc
+/debian/.debhelper/
+/debian/debhelper-build-stamp
+/debian/files
+/debian/*.substvars
+/debian/*.debhelper.log
+/debian/network-manager-openvpn3/
+/debian/network-manager-openvpn3-gnome/
+/debian/tmp/
+/obj-*/
+/dist/
+/tests/integration/.vagrant*/

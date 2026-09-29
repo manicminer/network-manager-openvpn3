@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Disposable VMs for the integration test (libvirt provider).
+#   BOX=cloud-image/ubuntu-26.04 DEBS=../../dist vagrant up && vagrant ssh -c 'sudo /repo/tests/integration/run.sh /debs'
+# Use a separate VAGRANT_DOTFILE_PATH per BOX to keep several VMs.
+
+Vagrant.configure("2") do |config|
+  box = ENV.fetch("BOX", "cloud-image/ubuntu-26.04")
+  config.vm.box = box
+  config.vm.synced_folder ".", "/vagrant", disabled: true
+  config.vm.synced_folder "../..", "/repo", type: "rsync", rsync__exclude: [".git/", "build/", "dist/"]
+  config.vm.synced_folder ENV.fetch("DEBS", "../../dist"), "/debs", type: "rsync"
+  config.vm.provider :libvirt do |lv|
+    # One domain per box, so several releases can run side by side.
+    lv.default_prefix = "nmovpn3-#{box.tr("/.", "--")}-"
+    lv.memory = 2048
+    lv.cpus = 2
+  end
+end

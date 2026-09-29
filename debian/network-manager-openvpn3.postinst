@@ -1,0 +1,19 @@
+#!/bin/sh
+set -e
+
+# openvpn3 leaves DNS alone unless its netcfg service is told which resolver
+# to use. On a fresh install with systemd-resolved running, turn that on so
+# pushed DNS servers reach NetworkManager. An existing netcfg configuration
+# is the administrator's choice and is not touched. The setting is picked up
+# the next time openvpn3-service-netcfg starts (it exits when idle).
+if [ "$1" = configure ] && [ -z "$2" ] \
+   && [ ! -e /var/lib/openvpn3/netcfg.json ] && [ -d /run/systemd/resolve ]; then
+    # Same content as `openvpn3-admin netcfg-service --config-set
+    # systemd-resolved 1`, which needs the D-Bus policies of a package
+    # installed in the same transaction and can fail here.
+    install -d -m 755 -o _openvpn -g _openvpn /var/lib/openvpn3
+    printf '{\n\t"systemd_resolved" : true\n}\n' > /var/lib/openvpn3/netcfg.json
+    chmod 644 /var/lib/openvpn3/netcfg.json
+fi
+
+#DEBHELPER#

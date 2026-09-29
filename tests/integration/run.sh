@@ -70,7 +70,17 @@ make_pki() {
   printf 'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature\nextendedKeyUsage=serverAuth\n' > ext.cnf
   openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 2 \
     -extfile ext.cnf -out server.crt 2>/dev/null
-  cp ca.crt "$WORK/"
+  # Client certificate for the certificate-only server: as a password
+  # protected PKCS#12 bundle and as an encrypted PEM key.
+  openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+    -subj "/CN=testuser" -keyout client.key -out client.csr 2>/dev/null
+  printf 'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature\nextendedKeyUsage=clientAuth\n' > cext.cnf
+  openssl x509 -req -in client.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 2 \
+    -extfile cext.cnf -out client.crt 2>/dev/null
+  openssl pkcs12 -export -in client.crt -inkey client.key -certfile ca.crt \
+    -passout pass:p12pass -out "$WORK/client.p12"
+  openssl pkcs8 -topk8 -in client.key -passout pass:keypass -out "$WORK/client-enc.key"
+  cp ca.crt client.crt "$WORK/"
 }
 
 start_server() {
@@ -95,7 +105,7 @@ proto udp
 dev tun-it-srv
 dev-type tun
 topology subnet
-server $SERVER_NET 255.255.255.0
+server $SERVER_NET 255.255.255.128
 ca $SRV/ca.crt
 cert $SRV/server.crt
 key $SRV/server.key
@@ -110,8 +120,15 @@ push "dhcp-option DOMAIN $PUSHED_DOMAIN"
 keepalive 2 10
 verb 3
 EOF
-  systemctl restart openvpn-server@it
+  # Second server: client certificate only, no username/password.
+  sed -e 's/^port 1194/port 1195/' -e 's/^dev tun-it-srv/dev tun-it-srv2/' \
+      -e "s/^server .*/server ${SERVER_NET%.*}.128 255.255.255.128/" \
+      -e '/^verify-client-cert/d' -e '/^username-as-common-name/d' \
+      -e '/^script-security/d' -e '/^auth-user-pass-verify/d' \
+      /etc/openvpn/server/it.conf > /etc/openvpn/server/it2.conf
+  systemctl restart openvpn-server@it openvpn-server@it2
   wait_for 20 "server tun device" ip link show tun-it-srv
+  wait_for 20 "second server tun device" ip link show tun-it-srv2
 }
 
 write_profile() { # write_profile <path> [password] [extra directive]; no password: prompt
@@ -237,11 +254,36 @@ test_static_challenge() {
   nmcli connection delete it-otp >/dev/null
 }
 
+test_client_certificates() {
+  log "Client certificate: PKCS#12 bundle and encrypted PEM key, passphrase from the agent"
+  printf 'client\ndev tun\nproto udp\nremote 127.0.0.1 1195\nnobind\nremote-cert-tls server\nca ca.crt\npkcs12 client.p12\n' \
+    > "$WORK/it-p12.ovpn"
+  printf 'client\ndev tun\nproto udp\nremote 127.0.0.1 1195\nnobind\nremote-cert-tls server\nca ca.crt\ncert client.crt\nkey client-enc.key\n' \
+    > "$WORK/it-key.ovpn"
+  local name pass
+  for name in it-p12:p12pass it-key:keypass; do
+    pass=${name#*:}; name=${name%%:*}
+    nmcli connection import type openvpn3 file "$WORK/$name.ovpn"
+    [ "$(nmcli -g vpn.data connection show "$name" | grep -o 'cert-pass-flags = [0-9]')" = "cert-pass-flags = 1" ] \
+      || fail "$name: key passphrase is not agent-owned"
+    printf 'vpn.secrets.cert-pass:%s\n' "$pass" > "$WORK/secrets"
+    nmcli --wait 40 connection up "$name" passwd-file "$WORK/secrets" || fail "$name: connection failed"
+    wait_for 30 "$name activated" is_activated "$name"
+    ping -c 1 -W 2 "${SERVER_NET%.*}.129" >/dev/null || fail "$name: no traffic through the tunnel"
+    nmcli connection down "$name"
+    printf 'vpn.secrets.cert-pass:wrong\n' > "$WORK/secrets"
+    if nmcli --wait 40 connection up "$name" passwd-file "$WORK/secrets" >/dev/null 2>&1; then
+      fail "$name: came up with a wrong passphrase"
+    fi
+    nmcli connection delete "$name" >/dev/null
+  done
+}
+
 cleanup() {
   nmcli connection delete "$CON" it-base >/dev/null 2>&1 || :
-  systemctl stop openvpn-server@it 2>/dev/null || :
+  systemctl stop openvpn-server@it openvpn-server@it2 2>/dev/null || :
   rm -f /etc/NetworkManager/conf.d/10-globally-managed-devices.conf
-  rm -rf "$WORK" "$SRV" /etc/openvpn/server/it.conf /etc/openvpn/server/check-user.sh
+  rm -rf "$WORK" "$SRV" /etc/openvpn/server/it.conf /etc/openvpn/server/it2.conf /etc/openvpn/server/check-user.sh
 }
 
 install_packages
@@ -254,5 +296,6 @@ test_disconnect
 test_bad_password
 test_agent_password
 test_static_challenge
+test_client_certificates
 cleanup
 log "ALL INTEGRATION TESTS PASSED"

@@ -1,0 +1,111 @@
+name: Bug report
+description: Something does not work — connecting, importing, the editor, the password prompt.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. The details below are needed to reproduce the problem;
+        a report without logs and versions usually cannot be acted on.
+
+        **Before pasting anything, remove private data:** server names and addresses,
+        usernames, login URLs, certificates and keys. Replace them with placeholders such as
+        `vpn.example.net` or `192.0.2.1`. Never attach your `.ovpn` profile as is.
+
+        One command collects most of what is asked for below:
+
+        ```sh
+        { . /etc/os-release; echo "OS: $PRETTY_NAME"; uname -r
+          echo "Desktop: $XDG_CURRENT_DESKTOP $XDG_SESSION_TYPE"; gnome-shell --version 2>/dev/null
+          dpkg-query -W 'network-manager' 'network-manager-openvpn3*' 'openvpn3*' 2>/dev/null
+          echo "--- netcfg"; cat /var/lib/openvpn3/netcfg.json 2>/dev/null
+          echo "--- journal"; journalctl -b -u NetworkManager --no-pager | grep -E 'nm-openvpn3|vpn\[' | tail -n 100
+        } 2>&1
+        ```
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, what happened instead. Include the exact error message.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Import the profile with `nmcli connection import type openvpn3 file office.ovpn`
+        2. Switch the VPN on in Quick Settings
+        3. ...
+    validations:
+      required: true
+  - type: dropdown
+    id: where
+    attributes:
+      label: Where
+      multiple: true
+      options:
+        - GNOME Quick Settings / VPN menu
+        - GNOME Settings (editor)
+        - nm-connection-editor (GTK 3 editor)
+        - nmcli
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: auth
+    attributes:
+      label: Authentication used by the profile
+      multiple: true
+      options:
+        - Username and password
+        - One-time code (static or dynamic challenge)
+        - Web login (browser opens)
+        - Client certificate (PEM)
+        - Encrypted private key
+        - PKCS#12 bundle
+        - Not sure
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Distribution and release
+      placeholder: Ubuntu 26.04 / Ubuntu 24.04 / Debian 13
+    validations:
+      required: true
+  - type: textarea
+    id: versions
+    attributes:
+      label: Versions and environment
+      description: Output of the command above up to the `--- netcfg` line (OS, kernel, desktop, package versions).
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        The `--- netcfg` and `--- journal` parts of the command output, covering the failed attempt.
+        For more detail, reproduce once more and take the journal right after.
+        Remove server names, addresses, usernames and URLs.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: profile
+    attributes:
+      label: Profile directives (optional)
+      description: |
+        The directive names used by the profile, without values and without inline blocks, e.g.
+        `grep -oE '^[a-z0-9-]+' office.ovpn | sort -u`.
+      render: text
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I removed server names, addresses, usernames, URLs and key material from everything above.
+          required: true
+        - label: The same profile works with the openvpn3 command line (`openvpn3 session-start --config ...`), or I explained above why I could not test that.

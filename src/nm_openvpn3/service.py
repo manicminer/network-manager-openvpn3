@@ -4,13 +4,14 @@
 import base64
 import binascii
 import logging
+import urllib.parse
 
 import gi
 
 gi.require_version("NM", "1.0")
 from gi.repository import GLib, NM  # noqa: E402
 
-from . import ipconfig, ovpn  # noqa: E402
+from . import desktop, ipconfig, ovpn, pki  # noqa: E402
 from . import openvpn3 as ov3  # noqa: E402
 from .vpnplugin import PluginError, VpnPlugin  # noqa: E402
 
@@ -24,6 +25,7 @@ KEY_PROFILE = "profile"
 KEY_USERNAME = "username"
 KEY_PASSWORD = "password"
 KEY_CHALLENGE = "challenge-response"
+KEY_CERT_PASS = "cert-pass"
 
 HINT_CHALLENGE_ECHO = "x-challenge-echo"
 
@@ -36,6 +38,10 @@ def get_profile(s_vpn):
         return base64.b64decode(value, validate=True).decode("utf-8")
     except (binascii.Error, UnicodeDecodeError):
         raise PluginError("BadArguments", "The stored OpenVPN profile is corrupt")
+
+
+def _url_host(url):
+    return urllib.parse.urlsplit(url).hostname or "?"
 
 
 def _secret_flags(s_vpn, key):
@@ -68,11 +74,34 @@ class Tunnel:
         self.username = s_vpn.get_data_item(KEY_USERNAME)
         self.password = s_vpn.get_secret(KEY_PASSWORD)
         self.challenge = s_vpn.get_secret(KEY_CHALLENGE)
+        self.cert_pass = s_vpn.get_secret(KEY_CERT_PASS)
 
     # -- lifecycle ---------------------------------------------------------
 
     def start(self):
-        self.config_path = self.client.import_config(self.name, self.config)
+        try:
+            profile = self._profile_for_openvpn3()
+        except pki.WrongPassphrase:
+            if not self.interactive:
+                raise PluginError("BadArguments", "Wrong or missing passphrase for the PKCS#12 bundle")
+            # Ask once Connect has returned; the session starts in new_secrets().
+            GLib.idle_add(self._ask_cert_pass)
+            return
+        except pki.InvalidBundle as e:
+            raise PluginError("BadArguments", str(e))
+        self._start_session(profile)
+
+    def _ask_cert_pass(self):
+        self._ask([KEY_CERT_PASS], "Private key passphrase")
+        return GLib.SOURCE_REMOVE
+
+    def _profile_for_openvpn3(self):
+        if pki.has_pkcs12(self.config):
+            return pki.expand_pkcs12(self.config, self.cert_pass)
+        return self.config
+
+    def _start_session(self, profile):
+        self.config_path = self.client.import_config(self.name, profile)
         # Subscribe before NewTunnel: early status changes must not be lost.
         # StatusChange reaches us through the log service once LogForward is
         # enabled; AttentionRequired is broadcast by the session manager.
@@ -114,8 +143,8 @@ class Tunnel:
             if signal == "StatusChange":
                 self._on_status(*params.unpack())
             elif signal == "AttentionRequired":
-                t, g, msg = params.unpack()
-                log.info("attention required: type=%d group=%d %s", t, g, msg)
+                t, g, _msg = params.unpack()
+                log.info("attention required: type=%d group=%d", t, g)
         except Exception as e:
             # A GLib callback cannot propagate: fail the activation so the
             # user sees it instead of a connection stuck in "connecting".
@@ -128,12 +157,13 @@ class Tunnel:
         if (major, minor, msg) == self._last_status:
             return
         self._last_status = (major, minor, msg)
-        log.info("status %d/%d %s", major, minor, msg)
+        is_url = major == ov3.MAJOR_SESSION and minor == ov3.SESS_AUTH_URL
+        # The login URL carries a one-time token: keep it out of the journal.
+        log.info("status %d/%d %s", major, minor, _url_host(msg) if is_url else msg)
         if self.stopping:
             return
-        if major == ov3.MAJOR_SESSION and minor == ov3.SESS_AUTH_URL:
-            self._fail(NM.VpnPluginFailure.LOGIN_FAILED,
-                       "Web based authentication is not supported")
+        if is_url:
+            self._open_login_url(msg)
         elif minor == ov3.CFG_OK and not self.connect_started:
             self._ready_and_connect()
         elif minor == ov3.CFG_REQUIRE_USER:
@@ -147,6 +177,18 @@ class Tunnel:
                 or (major == ov3.MAJOR_PROCESS and minor in (ov3.PROC_STOPPED, ov3.PROC_KILLED)) \
                 or major == ov3.MAJOR_CFG_ERROR:
             self._fail(NM.VpnPluginFailure.CONNECT_FAILED, msg or "Connection failed")
+
+    def _open_login_url(self, url):
+        """Web based login: open the server's URL in the desktop user's browser."""
+        if urllib.parse.urlsplit(url).scheme != "https":
+            self._fail(NM.VpnPluginFailure.LOGIN_FAILED, "The server asked to open a non-https login URL")
+            return
+        try:
+            user = desktop.open_url(url)
+        except desktop.NoDesktopUser as e:
+            self._fail(NM.VpnPluginFailure.LOGIN_FAILED, f"Web based login needs a browser: {e}")
+            return
+        log.info("opened the login page on %s for %s, waiting for the server", _url_host(url), user)
 
     def _ready_and_connect(self):
         try:
@@ -192,6 +234,10 @@ class Tunnel:
             if self.password:
                 return self.password
             return self._ask([KEY_PASSWORD], description)
+        if group == ov3.GRP_PK_PASSPHRASE:
+            if self.cert_pass:
+                return self.cert_pass
+            return self._ask([KEY_CERT_PASS], description)
         if group in (ov3.GRP_CHALLENGE_STATIC, ov3.GRP_CHALLENGE_DYNAMIC):
             if self.challenge:
                 value, self.challenge = self.challenge, None
@@ -216,6 +262,15 @@ class Tunnel:
 
     def new_secrets(self, connection):
         self.update_connection(connection)
+        if self.session is None:
+            # Waiting for the PKCS#12 passphrase before any session exists.
+            try:
+                profile = self._profile_for_openvpn3()
+            except pki.WrongPassphrase:
+                self._fail(NM.VpnPluginFailure.LOGIN_FAILED, "Wrong passphrase for the PKCS#12 bundle")
+                return
+            self._start_session(profile)
+            return
         self._provide_inputs()
 
     def _report_connected(self):
@@ -264,9 +319,19 @@ class Plugin(VpnPlugin):
     def do_need_secrets(self, connection):
         s_vpn = connection.get_setting_vpn()
         config = get_profile(s_vpn) or ""
-        if ovpn.needs_user_pass(config) and not s_vpn.get_secret(KEY_PASSWORD) \
-                and not _secret_flags(s_vpn, KEY_PASSWORD) & NM.SettingSecretFlags.NOT_REQUIRED:
+
+        def missing(key):
+            return not s_vpn.get_secret(key) \
+                and not _secret_flags(s_vpn, key) & NM.SettingSecretFlags.NOT_REQUIRED
+
+        if ovpn.needs_user_pass(config) and missing(KEY_PASSWORD):
             return NM.SETTING_VPN_SETTING_NAME
+        if missing(KEY_CERT_PASS):
+            try:
+                if pki.needs_passphrase(config):
+                    return NM.SETTING_VPN_SETTING_NAME
+            except pki.InvalidBundle as e:
+                raise PluginError("BadArguments", str(e))
         return None
 
     def do_new_secrets(self, connection):

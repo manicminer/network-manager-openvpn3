@@ -1,0 +1,21 @@
+name: Feature request
+description: Something the plugin should support.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: What you need
+      description: The use case and what should happen. If it is about a profile option, name the directive.
+    validations:
+      required: true
+  - type: textarea
+    id: now
+    attributes:
+      label: What happens now
+      description: Current behaviour, with log lines if relevant (without private data).
+  - type: input
+    id: os
+    attributes:
+      label: Distribution and release
+      placeholder: Ubuntu 26.04

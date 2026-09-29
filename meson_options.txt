@@ -1,1 +1,2 @@
 option('gnome', type: 'boolean', value: true, description: 'Build the GTK 4 editor for GNOME Settings')
+option('gtk3', type: 'boolean', value: true, description: 'Build the GTK 3 editor for nm-connection-editor')

@@ -1,1 +1,2 @@
 usr/lib/*/NetworkManager/libnm-gtk4-vpn-plugin-openvpn3-editor.so
+usr/lib/*/NetworkManager/libnm-vpn-plugin-openvpn3-editor.so

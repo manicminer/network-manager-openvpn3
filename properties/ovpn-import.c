@@ -145,6 +145,9 @@ openvpn3_profile_parse(const char *text, const char *base_dir, GError **error)
             } else if (creds) {
                 g_string_append_printf(creds, "%s\n", line);
             } else {
+                if (g_str_equal(inline_tag, "key")
+                    && (strstr(line, "ENCRYPTED PRIVATE KEY") || strstr(line, "Proc-Type: 4,ENCRYPTED")))
+                    p->needs_cert_pass = TRUE;
                 g_string_append_printf(out, "%s\n", g_strchomp(*l));
             }
             continue;
@@ -155,6 +158,8 @@ openvpn3_profile_parse(const char *text, const char *base_dir, GError **error)
                 creds              = g_string_new(NULL);
                 has_auth_user_pass = TRUE;
             } else {
+                if (g_str_equal(inline_tag, "pkcs12"))
+                    p->needs_cert_pass = TRUE;
                 g_string_append_printf(out, "%s\n", line);
             }
             continue;
@@ -188,16 +193,35 @@ openvpn3_profile_parse(const char *text, const char *base_dir, GError **error)
             wrote_auth_user_pass = TRUE;
             continue;
         }
-        if (g_str_equal(name, "pkcs12")) {
-            g_set_error(error, NM_CONNECTION_ERROR, NM_CONNECTION_ERROR_INVALID_PROPERTY,
-                        "PKCS#12 files are not supported, convert them to PEM (ca, cert, key)");
-            return NULL;
+        if (g_str_equal(name, "pkcs12") && words[1] && !g_str_equal(words[1], "[inline]")) {
+            /* openvpn3 cannot read PKCS#12; the service converts the bundle
+             * when connecting, so keep it inline as base64. */
+            g_autofree char *path = g_path_is_absolute(words[1]) ? g_strdup(words[1])
+                                                                 : g_build_filename(base_dir, words[1], NULL);
+            g_autofree char *raw  = NULL;
+            g_autofree char *b64  = NULL;
+            gsize len;
+
+            if (!g_file_get_contents(path, &raw, &len, error)) {
+                g_prefix_error(error, "Cannot read file referenced by the profile: ");
+                return NULL;
+            }
+            b64 = g_base64_encode((const guchar *) raw, len);
+            g_string_append(out, "<pkcs12>\n");
+            for (gsize i = 0, n = strlen(b64); i < n; i += 64)
+                g_string_append_printf(out, "%.64s\n", b64 + i);
+            g_string_append(out, "</pkcs12>\n");
+            p->needs_cert_pass = TRUE;
+            continue;
         }
         if (is_file_directive(name) && words[1] && !g_str_equal(words[1], "[inline]")
             && !(g_str_equal(name, "crl-verify") && words[2] && g_str_equal(words[2], "dir"))) {
             g_autofree char *contents = read_referenced(base_dir, words[1], error);
             if (!contents)
                 return NULL;
+            if (g_str_equal(name, "key")
+                && (strstr(contents, "ENCRYPTED PRIVATE KEY") || strstr(contents, "Proc-Type: 4,ENCRYPTED")))
+                p->needs_cert_pass = TRUE;
             append_inline(out, name, contents);
             if (g_str_equal(name, "tls-auth") && words[2])
                 g_string_append_printf(out, "key-direction %s\n", words[2]);
@@ -272,6 +296,8 @@ openvpn3_connection_from_profile(Openvpn3Profile *p, const char *id)
          * secret agents only ask for secrets flagged this way. */
         nm_setting_set_secret_flags(s_vpn, OPENVPN3_KEY_CHALLENGE, NM_SETTING_SECRET_FLAG_NOT_SAVED, NULL);
     }
+    if (p->needs_cert_pass)
+        nm_setting_set_secret_flags(s_vpn, OPENVPN3_KEY_CERT_PASS, NM_SETTING_SECRET_FLAG_AGENT_OWNED, NULL);
     nm_connection_add_setting(con, s_vpn);
 
     nm_connection_add_setting(con, nm_setting_ip4_config_new());

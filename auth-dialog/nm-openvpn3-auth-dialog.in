@@ -17,26 +17,45 @@ import time
 
 import gi
 
+sys.path.insert(0, "@pkgdatadir@")
+
 gi.require_version("NM", "1.0")
 from gi.repository import GLib, NM  # noqa: E402
 
+from nm_openvpn3 import pki  # noqa: E402
+
 KEY_PASSWORD = "password"
 KEY_CHALLENGE = "challenge-response"
+KEY_CERT_PASS = "cert-pass"
 HINT_MESSAGE = "x-vpn-message:"
 HINT_CHALLENGE_ECHO = "x-challenge-echo"
 
 
-def needs_user_pass(profile_b64):
+def decode_profile(profile_b64):
     try:
-        config = base64.b64decode(profile_b64 or "", validate=True).decode("utf-8")
+        return base64.b64decode(profile_b64 or "", validate=True).decode("utf-8")
     except (binascii.Error, UnicodeDecodeError):
+        return None
+
+
+def needs_user_pass(config):
+    if config is None:
         return True  # cannot tell: ask rather than fail silently
     return any(line.strip() == "auth-user-pass" for line in config.splitlines())
 
 
-def password_flags(data):
+def needs_cert_pass(config):
+    if config is None:
+        return False
     try:
-        return NM.SettingSecretFlags(int(data.get(KEY_PASSWORD + "-flags", "0")))
+        return pki.needs_passphrase(config)
+    except pki.InvalidBundle:
+        return False  # the service reports the broken bundle
+
+
+def secret_flags(data, key):
+    try:
+        return NM.SettingSecretFlags(int(data.get(key + "-flags", "0")))
     except ValueError:
         return NM.SettingSecretFlags.NONE
 
@@ -76,12 +95,20 @@ def plan(data, secrets, hints, retry):
         echo = HINT_CHALLENGE_ECHO in hints
         return message, [Field(KEY_CHALLENGE, message or "Response", "", True, echo=echo)]
 
+    if KEY_CERT_PASS in hints:
+        # The service found the stored passphrase wrong or missing.
+        return message, [Field(KEY_CERT_PASS, "Private key passphrase", "", True)]
+
+    config = decode_profile(data.get("profile"))
     fields = []
-    flags = password_flags(data)
-    if needs_user_pass(data.get("profile")) and not flags & NM.SettingSecretFlags.NOT_REQUIRED:
-        existing = secrets.get(KEY_PASSWORD, "")
+    for key, label, needed in ((KEY_PASSWORD, "Password", needs_user_pass(config)),
+                               (KEY_CERT_PASS, "Private key passphrase", needs_cert_pass(config))):
+        flags = secret_flags(data, key)
+        if not needed or flags & NM.SettingSecretFlags.NOT_REQUIRED:
+            continue
+        existing = secrets.get(key, "")
         ask = retry or not existing or bool(flags & NM.SettingSecretFlags.NOT_SAVED)
-        fields.append(Field(KEY_PASSWORD, "Password", existing, ask))
+        fields.append(Field(key, label, existing, ask))
     return message, fields
 
 

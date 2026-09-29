@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 project('network-manager-openvpn3', 'c',
-  version: '0.0.1',
+  version: '0.1.0',
   license: 'GPL-2.0-or-later',
   meson_version: '>= 1.0',
   default_options: ['c_std=gnu11', 'warning_level=2'])
@@ -47,16 +47,21 @@ shared_module('nm-vpn-plugin-openvpn3', 'properties/nm-openvpn3-editor-plugin.c'
   link_args: ['-Wl,--version-script=' + meson.current_source_dir() / 'properties/plugin.ver'],
   install: true, install_dir: plugindir)
 
-if get_option('gnome')
-  gtk4 = dependency('gtk4', version: '>= 4.10')
-  libnma = dependency('libnma-gtk4', version: '>= 1.10')
-  shared_module('nm-gtk4-vpn-plugin-openvpn3-editor', 'properties/nm-openvpn3-editor.c',
-    name_prefix: 'lib',
-    link_with: import_lib,
-    dependencies: [libnm, gtk4, libnma],
-    link_args: ['-Wl,--version-script=' + meson.current_source_dir() / 'properties/editor.ver'],
-    install: true, install_dir: plugindir)
-endif
+# Editors: GTK 4 for GNOME Settings, GTK 3 for nm-connection-editor.
+editors = [
+  ['gnome', 'nm-gtk4-vpn-plugin-openvpn3-editor', ['gtk4', '>= 4.10'], 'libnma-gtk4'],
+  ['gtk3', 'nm-vpn-plugin-openvpn3-editor', ['gtk+-3.0', '>= 3.22'], 'libnma'],
+]
+foreach e : editors
+  if get_option(e[0])
+    shared_module(e[1], 'properties/nm-openvpn3-editor.c',
+      name_prefix: 'lib',
+      link_with: import_lib,
+      dependencies: [libnm, dependency(e[2][0], version: e[2][1]), dependency(e[3], version: '>= 1.10')],
+      link_args: ['-Wl,--version-script=' + meson.current_source_dir() / 'properties/editor.ver'],
+      install: true, install_dir: plugindir)
+  endif
+endforeach
 
 pytest = find_program('pytest-3', 'pytest', required: false)
 if pytest.found()

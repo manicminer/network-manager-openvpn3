@@ -1,3 +1,15 @@
+network-manager-openvpn3 (0.1.0) unstable; urgency=medium
+
+  * Web based login: open the server's login URL in the desktop user's
+    browser (through xdg-desktop-portal) and wait for the server.
+  * PKCS#12 client credentials: the bundle is kept in the connection and
+    converted to PEM for openvpn3 when connecting.
+  * Encrypted private keys: passphrase as a NetworkManager secret.
+  * GTK 3 editor for nm-connection-editor next to the GTK 4 one.
+  * Keep login URLs out of the journal.
+
+ -- AlexeySetevoi <17676189+AlexeySetevoi@users.noreply.github.com>  Tue, 29 Sep 2026 13:00:00 +0000
+
 network-manager-openvpn3 (0.0.1) unstable; urgency=medium
 
   * Initial release.

@@ -11,7 +11,8 @@
 
 #include "ovpn-import.h"
 
-#define EDITOR_LIBRARY "libnm-gtk4-vpn-plugin-openvpn3-editor.so"
+#define EDITOR_GTK4 "libnm-gtk4-vpn-plugin-openvpn3-editor.so"
+#define EDITOR_GTK3 "libnm-vpn-plugin-openvpn3-editor.so"
 #define EDITOR_FACTORY "nm_vpn_editor_factory_openvpn3"
 
 typedef NMVpnEditor *(*EditorFactory)(NMVpnEditorPlugin *plugin, NMConnection *connection, GError **error);
@@ -82,15 +83,15 @@ get_capabilities(NMVpnEditorPlugin *plugin)
 }
 
 static char *
-editor_path(void)
+editor_path(const char *library)
 {
     Dl_info info;
     g_autofree char *dir = NULL;
 
     if (!dladdr((void *) get_capabilities, &info) || !info.dli_fname)
-        return g_strdup(EDITOR_LIBRARY);
+        return g_strdup(library);
     dir = g_path_get_dirname(info.dli_fname);
-    return g_build_filename(dir, EDITOR_LIBRARY, NULL);
+    return g_build_filename(dir, library, NULL);
 }
 
 static NMVpnEditor *
@@ -102,14 +103,20 @@ get_editor(NMVpnEditorPlugin *plugin, NMConnection *connection, GError **error)
         g_autofree char *path = NULL;
         void *handle;
 
-        /* Only GTK 4 hosts are supported; loading a GTK 4 library into a
-         * GTK 3 process would abort it. */
-        if (!dlsym(RTLD_DEFAULT, "gtk_widget_get_first_child")) {
+        const char *library;
+
+        /* Pick the editor built for the GTK the host already runs: loading
+         * the other major version into the process would abort it. */
+        if (dlsym(RTLD_DEFAULT, "gtk_widget_get_first_child"))
+            library = EDITOR_GTK4;
+        else if (dlsym(RTLD_DEFAULT, "gtk_widget_show_all"))
+            library = EDITOR_GTK3;
+        else {
             g_set_error_literal(error, NM_VPN_PLUGIN_ERROR, NM_VPN_PLUGIN_ERROR_FAILED,
-                                "The openvpn3 editor requires a GTK 4 application");
+                                "The openvpn3 editor needs a GTK 3 or GTK 4 application");
             return NULL;
         }
-        path   = editor_path();
+        path   = editor_path(library);
         handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
         if (!handle) {
             g_set_error(error, NM_VPN_PLUGIN_ERROR, NM_VPN_PLUGIN_ERROR_FAILED,

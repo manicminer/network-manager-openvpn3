@@ -88,14 +88,37 @@ After that the connection is in the VPN menu of Quick Settings.
   asks for it and can keep it in the keyring.
 - One-time codes (`static-challenge`, and dynamic challenges sent by the
   server) are asked for on every connect and never stored.
+- Web based login (the server sends a URL, e.g. SSO/OAuth after the
+  password): the login page opens in the browser of the user at the desktop
+  (the active graphical session), and the connection completes once the
+  login is done there. NetworkManager gives a VPN 60 seconds to come up by
+  default; for slow logins raise it, e.g.
+  `nmcli connection modify office vpn.timeout 180`.
+- Client certificates: PEM `cert`/`key`, encrypted private keys and PKCS#12
+  bundles (`pkcs12`). openvpn3 itself cannot read PKCS#12, so the bundle is
+  kept in the connection and converted to PEM in memory when connecting. The
+  passphrase of an encrypted key or bundle is a NetworkManager secret
+  ("Private key passphrase"), asked for by GNOME and optionally kept in the
+  keyring.
 - Exported profiles contain no credentials.
 
-### Not supported
+### Editors
 
-- Web based authentication (SAML / "open this URL" flows).
-- PKCS#11 tokens and PKCS#12 files; convert PKCS#12 to PEM (`ca`, `cert`, `key`).
-- GTK 3 connection editors such as `nm-connection-editor` (use GNOME
-  Settings or `nmcli`).
+- **GNOME Settings** uses the GTK 4 editor, **nm-connection-editor** the
+  GTK 3 one; both come with `network-manager-openvpn3-gnome`. They load a
+  profile from a file and edit the username and the stored secrets.
+
+### Limitation: PKCS#11
+
+Hardware tokens and smart cards (`pkcs11-providers`, `pkcs11-id`) do not work
+because openvpn3 has no PKCS#11 / external key support: in openvpn3-linux
+(checked v24 to v27) the external PKI callbacks are unimplemented
+([`core-client.hpp`](https://github.com/OpenVPN/openvpn3-linux/blob/master/src/client/core-client.hpp),
+`external_pki_cert_request` / `external_pki_sign_request`), and a profile
+without a PEM key is rejected with *"Configuration requires external PKI
+which is not implemented yet"*. Nothing a front-end can do works around it;
+use the classic OpenVPN 2 NetworkManager plugin for such profiles until
+openvpn3 implements it.
 
 ## How it works
 
@@ -120,6 +143,14 @@ After that the connection is in the VPN menu of Quick Settings.
 
 Logs: `journalctl -u NetworkManager | grep nm-openvpn3`.
 
+## Reporting problems
+
+Open an [issue](https://github.com/AlexeySetevoi/network-manager-openvpn3/issues/new/choose).
+The bug report form asks for the distribution, package versions, desktop and
+the NetworkManager journal, and has a command that collects all of it.
+Remove server names, addresses, usernames and login URLs before posting, and
+never attach a profile as is.
+
 ## Building
 
 ```sh
@@ -142,12 +173,14 @@ scripts/build-deb.sh ubuntu:26.04 resolute dist/
 
 - `tests/unit`: profile import (through the built libnm plugin), the VPN
   plugin D-Bus contract, the session state machine against a fake openvpn3,
-  the auth dialog and, with a display, the GTK editor
-  (`GDK_BACKEND=broadway` works headless).
+  PKCS#12 conversion, the auth dialog and, with a display, the editors
+  (`GDK_BACKEND=broadway` works headless; `OPENVPN3_EDITOR_GTK=3` tests the
+  GTK 3 one).
 - `tests/integration/run.sh`: end to end on a disposable machine — a local
   OpenVPN server, openvpn3 as the client, NetworkManager with this plugin:
   connect, routes and DNS, reconnect, disconnect, wrong password, password
-  from a secret agent, one-time code. `tests/integration/Vagrantfile` runs it
+  from a secret agent, one-time code, PKCS#12 bundle and encrypted key
+  against a certificate-only server. `tests/integration/Vagrantfile` runs it
   in libvirt VMs:
 
   ```sh

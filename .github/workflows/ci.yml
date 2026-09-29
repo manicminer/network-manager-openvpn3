@@ -31,7 +31,7 @@ jobs:
           if-no-files-found: error
 
   editor:
-    name: GTK editor
+    name: GTK editors
     runs-on: ubuntu-24.04
     container: ubuntu:26.04
     steps:
@@ -41,14 +41,21 @@ jobs:
           apt-get update -qq
           DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
             build-essential meson pkgconf libnm-dev libnma-gtk4-dev libgtk-4-dev libglib2.0-dev \
-            python3-gi python3-pytest gir1.2-nm-1.0 gir1.2-gtk-4.0 libgtk-4-bin
-      - name: Test the editor under a headless display
+            libnma-dev libgtk-3-dev libgtk-3-bin gir1.2-gtk-3.0 \
+            python3-gi python3-pytest python3-cryptography gir1.2-nm-1.0 gir1.2-gtk-4.0 libgtk-4-bin
+      - name: Test the editors under a headless display
+        env:
+          OPENVPN3_EDITOR_TEST_REQUIRED: "1"
+          GDK_BACKEND: broadway
         run: |
           meson setup build
           ninja -C build
           gtk4-broadwayd :5 &
+          broadwayd :6 &
           sleep 1
-          GDK_BACKEND=broadway BROADWAY_DISPLAY=:5 OPENVPN3_PLUGIN_DIR="$PWD/build" OPENVPN3_EDITOR_TEST_REQUIRED=1 \
+          BROADWAY_DISPLAY=:5 OPENVPN3_PLUGIN_DIR="$PWD/build" \
+            python3 -m pytest -v -p no:cacheprovider tests/unit/test_editor.py
+          BROADWAY_DISPLAY=:6 OPENVPN3_EDITOR_GTK=3 OPENVPN3_PLUGIN_DIR="$PWD/build" \
             python3 -m pytest -v -p no:cacheprovider tests/unit/test_editor.py
 
   integration:

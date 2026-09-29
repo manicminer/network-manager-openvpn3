@@ -90,3 +90,15 @@ def test_external_ui_echo_challenge_is_still_secret(capsys):
     kf.load_from_data(text, len(text.encode()), GLib.KeyFileFlags.NONE)
     assert kf.get_boolean("challenge-response", "IsSecret")
     assert kf.get_boolean("challenge-response", "ForceEcho")
+
+
+def test_plan_asks_for_key_passphrase():
+    from pkihelp import pem_key
+    prof = base64.b64encode(f"client\nremote vpn.example.net\n<key>\n{pem_key(b'k')}</key>\n".encode()).decode()
+    _, fields = ad.plan({"profile": prof, "cert-pass-flags": "1"}, {}, [], False)
+    assert [(f.key, f.should_ask) for f in fields] == [("cert-pass", True)]
+
+
+def test_plan_cert_pass_hint():
+    _, fields = ad.plan({"profile": PROFILE}, {}, ["cert-pass"], False)
+    assert [f.key for f in fields] == ["cert-pass"]

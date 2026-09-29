@@ -11,6 +11,8 @@
 #define OPENVPN3_KEY_USERNAME "username"
 #define OPENVPN3_KEY_PASSWORD "password"
 #define OPENVPN3_KEY_CHALLENGE "challenge-response"
+/* Passphrase of the private key: PKCS#12 bundle or encrypted PEM key. */
+#define OPENVPN3_KEY_CERT_PASS "cert-pass"
 
 typedef struct {
     char *config;   /* profile with every file inlined, no credentials */
@@ -18,6 +20,7 @@ typedef struct {
     char *password; /* ditto */
     char *remote;   /* first remote host, may be NULL */
     gboolean needs_user_pass;
+    gboolean needs_cert_pass; /* PKCS#12 or encrypted private key */
 } Openvpn3Profile;
 
 void openvpn3_profile_free(Openvpn3Profile *p);

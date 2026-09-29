@@ -109,7 +109,7 @@ def test_commented_directive_is_not_credentials(plugin, tmp_path):
 
 
 @pytest.mark.parametrize("text,msg", [
-    ("client\nremote vpn.example.net\npkcs12 bundle.p12\n", "PKCS#12"),
+    ("client\nremote vpn.example.net\npkcs12 missing.p12\n", "Cannot read file"),
     ("client\nremote vpn.example.net\n<ca>\nabc\n", "Unterminated"),
     ("dev tun\nremote vpn.example.net\n", "Not an OpenVPN client profile"),
     ("client\nremote vpn.example.net\nca missing.crt\n", "Cannot read file"),
@@ -147,3 +147,32 @@ def test_stored_values_are_single_line(plugin, tmp_path):
     s = plugin.import_(path).get_setting_vpn()
     for key in s.get_data_keys():
         assert "\n" not in s.get_data_item(key)
+
+
+def test_pkcs12_file_is_embedded(plugin, tmp_path):
+    from pkihelp import p12
+    data, _, _ = p12()
+    (tmp_path / "client.p12").write_bytes(data)
+    path = write(tmp_path, "p.ovpn", "client\nremote vpn.example.net\npkcs12 client.p12\n")
+    s, config = vpn(plugin.import_(path))
+    assert "pkcs12 client.p12" not in config
+    b64 = config.split("<pkcs12>\n")[1].split("</pkcs12>")[0]
+    assert base64.b64decode("".join(b64.split())) == data
+    assert s.get_data_item("cert-pass-flags") == str(int(NM.SettingSecretFlags.AGENT_OWNED))
+
+
+def test_encrypted_key_needs_passphrase(plugin, tmp_path):
+    from pkihelp import pem_key
+    write(tmp_path, "client.key", pem_key(b"keypass"))
+    path = write(tmp_path, "k.ovpn", f"client\nremote vpn.example.net\n<ca>\n{PEM}</ca>\ncert c.crt\nkey client.key\n")
+    write(tmp_path, "c.crt", PEM)
+    s, config = vpn(plugin.import_(path))
+    assert "ENCRYPTED PRIVATE KEY" in config
+    assert s.get_data_item("cert-pass-flags") == str(int(NM.SettingSecretFlags.AGENT_OWNED))
+
+
+def test_plain_key_needs_no_passphrase(plugin, tmp_path):
+    from pkihelp import pem_key
+    path = write(tmp_path, "n.ovpn", f"client\nremote vpn.example.net\n<key>\n{pem_key()}</key>\n")
+    s, _ = vpn(plugin.import_(path))
+    assert s.get_data_item("cert-pass-flags") is None

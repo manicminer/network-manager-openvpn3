@@ -14,7 +14,7 @@ PROFILE = "client\ndev tun\nremote vpn.example.net 1194\nauth-user-pass\n"
 SESSION_PATH = "/net/openvpn/v3/sessions/test0"
 
 
-def make_connection(password="s3cret", username="testuser", config=PROFILE):
+def make_connection(password="s3cret", username="testuser", config=PROFILE, cert_pass=None):
     con = NM.SimpleConnection.new()
     s_con = NM.SettingConnection.new()
     s_con.set_property(NM.SETTING_CONNECTION_ID, "test-vpn")
@@ -27,6 +27,8 @@ def make_connection(password="s3cret", username="testuser", config=PROFILE):
         s_vpn.add_data_item(service.KEY_USERNAME, username)
     if password:
         s_vpn.add_secret(service.KEY_PASSWORD, password)
+    if cert_pass:
+        s_vpn.add_secret(service.KEY_CERT_PASS, cert_pass)
     con.add_setting(s_vpn)
     return con
 
@@ -229,10 +231,31 @@ def test_reconnect_resends_config():
     assert [e[0] for e in plugin.events] == ["config", "ip4", "config", "ip4"]
 
 
-def test_web_auth_is_rejected():
+def test_web_auth_opens_browser_and_waits(monkeypatch):
+    opened = []
+    monkeypatch.setattr(service.desktop, "open_url", lambda url: opened.append(url) or "testuser")
+    t, client, plugin = start(make_connection())
+    status(client, ov3.MAJOR_SESSION, ov3.SESS_AUTH_URL, "https://vpn.example.net/auth?state=x")
+    assert opened == ["https://vpn.example.net/auth?state=x"]
+    assert plugin.events == []
+    status(client, ov3.MAJOR_CONNECTION, ov3.CONN_CONNECTED)
+    assert [e[0] for e in plugin.events] == ["config", "ip4"]
+
+
+def test_web_auth_without_desktop_fails(monkeypatch):
+    def no_user(url):
+        raise service.desktop.NoDesktopUser("no active desktop session")
+    monkeypatch.setattr(service.desktop, "open_url", no_user)
     t, client, plugin = start(make_connection())
     status(client, ov3.MAJOR_SESSION, ov3.SESS_AUTH_URL, "https://vpn.example.net/auth")
-    assert plugin.events[0] == ("failure", NM.VpnPluginFailure.LOGIN_FAILED)
+    assert plugin.events == [("failure", NM.VpnPluginFailure.LOGIN_FAILED)]
+
+
+def test_web_auth_rejects_non_https(monkeypatch):
+    monkeypatch.setattr(service.desktop, "open_url", lambda url: pytest.fail("must not open"))
+    t, client, plugin = start(make_connection())
+    status(client, ov3.MAJOR_SESSION, ov3.SESS_AUTH_URL, "file:///etc/shadow")
+    assert plugin.events == [("failure", NM.VpnPluginFailure.LOGIN_FAILED)]
 
 
 def test_signals_for_other_sessions_are_ignored():
@@ -270,3 +293,53 @@ def test_missing_credentials_without_queued_inputs_waits():
     status(client, ov3.MAJOR_CONNECTION, ov3.CFG_OK)
     assert client.session.calls == ["ready"]
     assert plugin.events == []
+
+
+def test_portal_command_quotes_url():
+    cmd = service.desktop.portal_command("https://vpn.example.net/start?state=a'b&x=1")
+    arg = cmd[-2]
+    assert GLib.Variant.parse(None, arg, None, None).unpack() == "https://vpn.example.net/start?state=a'b&x=1"
+    assert cmd[cmd.index("--method") + 1] == "org.freedesktop.portal.OpenURI.OpenURI"
+
+
+PK_SLOT = [(ov3.ATTN_CREDENTIALS, ov3.GRP_PK_PASSPHRASE, 2, "pk_passphrase", "Private key passphrase", True)]
+
+
+def test_pkcs12_is_expanded_before_import():
+    from pkihelp import p12
+    from test_pki import profile_with
+    data, _, _ = p12()
+    t, client, plugin = start(make_connection(config=profile_with(data), password=None, cert_pass="p12pass"))
+    (_, imported), = client.imported
+    assert "<pkcs12>" not in imported and "BEGIN PRIVATE KEY" in imported
+
+
+def test_pkcs12_wrong_passphrase_asks_then_starts(monkeypatch):
+    from pkihelp import p12
+    from test_pki import profile_with
+    data, _, _ = p12()
+    idle = []
+    monkeypatch.setattr(service.GLib, "idle_add", lambda fn: idle.append(fn))
+    t, client, plugin = start(make_connection(config=profile_with(data), password=None, cert_pass="wrong"),
+                              interactive=True)
+    assert client.imported == []
+    idle[0]()
+    assert plugin.events == [("secrets", "Private key passphrase", ["cert-pass"])]
+    t.new_secrets(make_connection(config=profile_with(data), password=None, cert_pass="p12pass"))
+    assert len(client.imported) == 1
+
+
+def test_pkcs12_wrong_passphrase_noninteractive_is_an_error():
+    from pkihelp import p12
+    from test_pki import profile_with
+    data, _, _ = p12()
+    with pytest.raises(service.PluginError):
+        start(make_connection(config=profile_with(data), password=None, cert_pass="wrong"))
+
+
+def test_pk_passphrase_slot_is_answered():
+    t, client, plugin = start(make_connection(cert_pass="keypass"))
+    client.session.inputs = list(USERPASS) + PK_SLOT
+    client.session.need_creds = True
+    status(client, ov3.MAJOR_CONNECTION, ov3.CFG_REQUIRE_USER)
+    assert client.session.provided == {0: "testuser", 1: "s3cret", 2: "keypass"}

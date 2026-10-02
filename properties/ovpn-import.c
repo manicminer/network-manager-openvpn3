@@ -5,6 +5,11 @@
  * openvpn3 needs a self-contained profile, so every file referenced by the
  * profile is inlined.  Credentials are taken out of the profile and stored
  * in the connection instead: the username as data, the password as secret.
+ *
+ * Normalizing means inlining files and moving credentials out, nothing else:
+ * directive order, repeated directives, quoting, comments and directives this
+ * code has never heard of all come out the way they went in.  There is no
+ * list of allowed directives anywhere.
  */
 
 #include "ovpn-import.h"
@@ -14,6 +19,17 @@
 static const char *const file_directives[] = {
     "ca", "cert", "key", "extra-certs", "tls-auth", "tls-crypt", "tls-crypt-v2", "crl-verify", NULL,
 };
+
+/* <connection> holds options, not a payload: a client config may well keep
+ * its only remote -- and the files that remote needs -- inside one or more of
+ * these.  Its lines are therefore directives, and the ones naming a file are
+ * inlined where they stand, so the profile stays self-contained.
+ *
+ * Everything else in angle brackets (<ca>, <key>, <pkcs12>, <tls-auth> ...)
+ * is opaque content whose lines are copied out verbatim, nested in a
+ * <connection> or not.  Keep this in step with OPTION_SCOPES in
+ * src/nm_openvpn3/ovpn.py. */
+static const char *const option_scopes[] = {"connection", NULL};
 
 void
 openvpn3_profile_free(Openvpn3Profile *p)
@@ -71,6 +87,21 @@ is_file_directive(const char *name)
     return g_strv_contains(file_directives, name);
 }
 
+static gboolean
+is_option_scope(const char *tag)
+{
+    return g_strv_contains(option_scopes, tag);
+}
+
+/* "<tag>" -> tag, for an opening tag on a line of its own; else NULL. */
+static char *
+opening_tag(const char *line)
+{
+    if (line[0] != '<' || line[1] == '/' || !line[1] || !g_str_has_suffix(line, ">"))
+        return NULL;
+    return g_strndup(line + 1, strlen(line) - 2);
+}
+
 static char *
 read_referenced(const char *base_dir, const char *ref, GError **error)
 {
@@ -118,6 +149,7 @@ openvpn3_profile_parse(const char *text, const char *base_dir, GError **error)
     g_autoptr(GString) creds     = NULL;
     g_auto(GStrv) lines          = g_strsplit(text, "\n", -1);
     g_autofree char *inline_tag  = NULL;
+    g_autofree char *scope       = NULL;
     gboolean has_auth_user_pass  = FALSE;
     gboolean wrote_auth_user_pass = FALSE;
     gboolean has_client          = FALSE;
@@ -152,17 +184,37 @@ openvpn3_profile_parse(const char *text, const char *base_dir, GError **error)
             }
             continue;
         }
-        if (line[0] == '<' && g_str_has_suffix(line, ">") && line[1] != '/') {
-            inline_tag = g_strndup(line + 1, strlen(line) - 2);
-            if (g_str_equal(inline_tag, "auth-user-pass")) {
-                creds              = g_string_new(NULL);
-                has_auth_user_pass = TRUE;
-            } else {
-                if (g_str_equal(inline_tag, "pkcs12"))
-                    p->needs_cert_pass = TRUE;
+        /* The option scope we are in ends here. */
+        if (scope) {
+            g_autofree char *end = g_strdup_printf("</%s>", scope);
+
+            if (g_str_equal(line, end)) {
+                g_clear_pointer(&scope, g_free);
                 g_string_append_printf(out, "%s\n", line);
+                continue;
             }
-            continue;
+        }
+        {
+            g_autofree char *tag = opening_tag(line);
+
+            if (tag && is_option_scope(tag)) {
+                g_free(scope);
+                scope = g_steal_pointer(&tag);
+                g_string_append_printf(out, "%s\n", line);
+                continue;
+            }
+            if (tag) {
+                inline_tag = g_steal_pointer(&tag);
+                if (g_str_equal(inline_tag, "auth-user-pass")) {
+                    creds              = g_string_new(NULL);
+                    has_auth_user_pass = TRUE;
+                } else {
+                    if (g_str_equal(inline_tag, "pkcs12"))
+                        p->needs_cert_pass = TRUE;
+                    g_string_append_printf(out, "%s\n", line);
+                }
+                continue;
+            }
         }
 
         words = split_words(line);
@@ -230,9 +282,9 @@ openvpn3_profile_parse(const char *text, const char *base_dir, GError **error)
         g_string_append_printf(out, "%s\n", line);
     }
 
-    if (inline_tag) {
+    if (inline_tag || scope) {
         g_set_error(error, NM_CONNECTION_ERROR, NM_CONNECTION_ERROR_INVALID_PROPERTY,
-                    "Unterminated <%s> block in the profile", inline_tag);
+                    "Unterminated <%s> block in the profile", inline_tag ?: scope);
         return NULL;
     }
     if (!has_client || !has_remote) {
@@ -318,13 +370,88 @@ openvpn3_profile_remote(const char *config)
     return p ? g_strdup(p->remote) : NULL;
 }
 
+const char *
+openvpn3_setting_profile_storage(NMSettingVpn *s_vpn)
+{
+    const char *mode = s_vpn ? nm_setting_vpn_get_data_item(s_vpn, OPENVPN3_KEY_PROFILE_STORAGE) : NULL;
+
+    return (mode && *mode) ? mode : NULL;
+}
+
+gboolean
+openvpn3_setting_profile_is_secret(NMSettingVpn *s_vpn)
+{
+    const char *mode = openvpn3_setting_profile_storage(s_vpn);
+
+    return mode && g_str_equal(mode, OPENVPN3_PROFILE_STORAGE_SECRET);
+}
+
+gboolean
+openvpn3_setting_profile_storage_is_unsupported(NMSettingVpn *s_vpn)
+{
+    const char *mode = openvpn3_setting_profile_storage(s_vpn);
+
+    return mode && !g_str_equal(mode, OPENVPN3_PROFILE_STORAGE_SECRET);
+}
+
+char *
+openvpn3_setting_unsupported_storage_message(NMSettingVpn *s_vpn)
+{
+    return g_strdup_printf("This connection stores its OpenVPN profile as \"%s\", a layout "
+                           "this version does not know. Its %s data item belongs to the "
+                           "layout the connection used before, so it is not read. Update "
+                           "network-manager-openvpn3.",
+                           openvpn3_setting_profile_storage(s_vpn), OPENVPN3_KEY_PROFILE);
+}
+
+gboolean
+openvpn3_setting_profile_flags(NMSettingVpn *s_vpn, NMSettingSecretFlags *out_flags)
+{
+    const char *value;
+    char       *end;
+    gint64      number;
+
+    if (!openvpn3_setting_profile_is_secret(s_vpn)) {
+        *out_flags = NM_SETTING_SECRET_FLAG_NONE;
+        return TRUE;
+    }
+    value = nm_setting_vpn_get_data_item(s_vpn, OPENVPN3_KEY_PROFILE_FLAGS);
+    /* No flags means NM_SETTING_SECRET_FLAG_NONE to NetworkManager, i.e. a
+     * system-owned secret.  Reading it as agent-owned would move the profile
+     * of an unattended connection into a user's wallet behind their back. */
+    if (!value) {
+        *out_flags = NM_SETTING_SECRET_FLAG_NONE;
+        return TRUE;
+    }
+    /* Parsed here rather than through nm_setting_get_secret_flags(): what a
+     * value outside the enum turns into there is not something to rely on,
+     * and every one of them has to be refused anyway. */
+    number = g_ascii_strtoll(value, &end, 10);
+    if (end == value || *end)
+        return FALSE;
+    if (number != NM_SETTING_SECRET_FLAG_NONE && number != NM_SETTING_SECRET_FLAG_AGENT_OWNED)
+        return FALSE;
+    *out_flags = (NMSettingSecretFlags) number;
+    return TRUE;
+}
+
 char *
 openvpn3_setting_get_profile(NMSettingVpn *s_vpn)
 {
-    const char *b64 = s_vpn ? nm_setting_vpn_get_data_item(s_vpn, OPENVPN3_KEY_PROFILE) : NULL;
+    const char *b64;
     g_autofree guchar *raw = NULL;
     gsize len;
 
+    if (!s_vpn)
+        return NULL;
+    /* A layout this build does not know: the data item that goes with it is a
+     * leftover of whatever the connection used before, so reading it would
+     * hand out a stale profile.  Nothing is better than something wrong. */
+    if (openvpn3_setting_profile_storage_is_unsupported(s_vpn))
+        return NULL;
+    b64 = openvpn3_setting_profile_is_secret(s_vpn)
+              ? nm_setting_vpn_get_secret(s_vpn, OPENVPN3_KEY_PROFILE)
+              : nm_setting_vpn_get_data_item(s_vpn, OPENVPN3_KEY_PROFILE);
     if (!b64)
         return NULL;
     raw = g_base64_decode(b64, &len);
@@ -338,5 +465,36 @@ openvpn3_setting_set_profile(NMSettingVpn *s_vpn, const char *profile)
 {
     g_autofree char *b64 = g_base64_encode((const guchar *) profile, strlen(profile));
 
+    nm_setting_vpn_remove_secret(s_vpn, OPENVPN3_KEY_PROFILE);
+    nm_setting_vpn_remove_data_item(s_vpn, OPENVPN3_KEY_PROFILE_STORAGE);
+    nm_setting_vpn_remove_data_item(s_vpn, OPENVPN3_KEY_PROFILE_FLAGS);
     nm_setting_vpn_add_data_item(s_vpn, OPENVPN3_KEY_PROFILE, b64);
+}
+
+gboolean
+openvpn3_setting_set_profile_secret(NMSettingVpn        *s_vpn,
+                                    const char          *profile,
+                                    NMSettingSecretFlags flags,
+                                    GError             **error)
+{
+    g_autofree char *b64 = NULL;
+
+    /* Checked before anything is written: a caller that gets this wrong must
+     * end up with the connection it was given, not with one whose profile has
+     * been dropped on the way. */
+    if (flags != NM_SETTING_SECRET_FLAG_NONE && flags != NM_SETTING_SECRET_FLAG_AGENT_OWNED) {
+        g_set_error(error, NM_CONNECTION_ERROR, NM_CONNECTION_ERROR_INVALID_PROPERTY,
+                    "An OpenVPN profile cannot be stored with %s=%d: nothing would ever "
+                    "hand it back, so the connection could not be used.",
+                    OPENVPN3_KEY_PROFILE_FLAGS, (int) flags);
+        return FALSE;
+    }
+    b64 = g_base64_encode((const guchar *) profile, strlen(profile));
+
+    /* No duplicate public copy: it would outlive the secret and be used stale. */
+    nm_setting_vpn_remove_data_item(s_vpn, OPENVPN3_KEY_PROFILE);
+    nm_setting_vpn_add_data_item(s_vpn, OPENVPN3_KEY_PROFILE_STORAGE, OPENVPN3_PROFILE_STORAGE_SECRET);
+    nm_setting_set_secret_flags(NM_SETTING(s_vpn), OPENVPN3_KEY_PROFILE, flags, NULL);
+    nm_setting_vpn_add_secret(s_vpn, OPENVPN3_KEY_PROFILE, b64);
+    return TRUE;
 }

@@ -15,10 +15,22 @@ class StaticChallenge:
     text: str
     echo: bool
 
+# <connection> holds options, not a payload: a client profile may well keep
+# its only remote (and its credentials) in there.  Everything else between
+# angle brackets -- <ca>, <key>, <pkcs12> ... -- is opaque content whose lines
+# are not directives.  Keep this in step with option_scopes[] in
+# properties/ovpn-import.c.
+OPTION_SCOPES = ("connection",)
+
 
 def _directives(text):
-    """Yield (name, args) for every directive outside inline <tag> blocks."""
+    """Yield (name, args) for every directive, inline <tag> payloads excluded.
+
+    An option scope such as <connection> is reported as a block of its own and
+    its contents are then yielded as the directives they are.
+    """
     inline_tag = None
+    scope = None
     for raw in text.splitlines():
         line = raw.strip()
         if inline_tag is not None:
@@ -27,9 +39,16 @@ def _directives(text):
             continue
         if not line or line[0] in "#;":
             continue
+        if line.startswith("</") and line.endswith(">") and line[2:-1] == scope:
+            scope = None
+            continue
         if line.startswith("<") and line.endswith(">") and not line.startswith("</"):
-            inline_tag = line[1:-1]
-            yield inline_tag, []
+            tag = line[1:-1]
+            if tag in OPTION_SCOPES:
+                scope = tag
+            else:
+                inline_tag = tag
+            yield tag, []
             continue
         try:
             parts = shlex.split(line, comments=False)

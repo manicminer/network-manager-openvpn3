@@ -42,7 +42,27 @@ struct _Openvpn3Editor {
     Row        cert_pass;
     GtkWidget *show_passwords;
     char      *config;
+    /* The profile may be one of the connection's secrets; then it is not
+     * ours to downgrade, and an editor that could not read it must not
+     * overwrite it. */
+    gboolean             profile_is_secret;
+    NMSettingSecretFlags profile_flags;
+    /* Why saving is refused, rather than writing a connection whose profile
+     * this editor could not read or could not store back.  @unsupported is
+     * about the storage layout and no profile file can change it; @refusal is
+     * about the profile itself, so loading one from a file clears it. */
+    char                *unsupported;
+    char                *refusal;
 };
+
+#define LOCKED_PROFILE_MESSAGE                                                                     \
+    "This connection keeps its profile with its secrets and it was not available here. "           \
+    "Unlock the secrets, or load a profile from a file, before saving."
+
+#define UNSTORABLE_FLAGS_MESSAGE                                                                   \
+    "This connection's " OPENVPN3_KEY_PROFILE_FLAGS " say its profile is never stored, so "        \
+    "nothing could hand it back. Saving is refused; fix the connection with nmcli or "             \
+    "load a profile from a file."
 
 static void openvpn3_editor_interface_init(NMVpnEditorInterface *iface);
 
@@ -71,7 +91,11 @@ refresh_profile(Openvpn3Editor *self)
 
     gtk_label_set_text(GTK_LABEL(self->remote_label), p && p->remote ? p->remote : "—");
     gtk_label_set_text(GTK_LABEL(self->status_label),
-                       !self->config ? "No profile loaded yet" : p ? "Profile loaded" : error->message);
+                       self->unsupported ? self->unsupported
+                       : self->refusal ? self->refusal
+                       : !self->config ? "No profile loaded yet"
+                       : p             ? "Profile loaded"
+                                       : error->message);
     row_set_visible(&self->username, !p || p->needs_user_pass);
     row_set_visible(&self->password, !p || p->needs_user_pass);
     row_set_visible(&self->cert_pass, p && p->needs_cert_pass);
@@ -89,6 +113,10 @@ load_profile(Openvpn3Editor *self, const char *path)
     }
     g_free(self->config);
     self->config = g_steal_pointer(&p->config);
+    /* The file replaces what could not be read or stored back.  An unknown
+     * storage layout is not repaired by it: writing the connection would
+     * still have to reclassify a layout this build does not understand. */
+    g_clear_pointer(&self->refusal, g_free);
     if (p->username)
         entry_set_text(self->username.entry, p->username);
     if (p->password)
@@ -243,7 +271,21 @@ build_ui(Openvpn3Editor *self, NMConnection *connection)
     g_signal_connect(self->show_passwords, "toggled", G_CALLBACK(show_passwords_toggled), self);
 
     if (s_vpn) {
-        self->config = openvpn3_setting_get_profile(s_vpn);
+        if (openvpn3_setting_profile_storage_is_unsupported(s_vpn)) {
+            self->unsupported = openvpn3_setting_unsupported_storage_message(s_vpn);
+        } else {
+            self->profile_is_secret = openvpn3_setting_profile_is_secret(s_vpn);
+            if (!openvpn3_setting_profile_flags(s_vpn, &self->profile_flags)) {
+                /* Nothing would ever hand this profile back.  A profile
+                 * loaded from a file repairs it, and goes to the user's
+                 * wallet like any newly stored profile. */
+                self->profile_flags = NM_SETTING_SECRET_FLAG_AGENT_OWNED;
+                self->refusal       = g_strdup(UNSTORABLE_FLAGS_MESSAGE);
+            }
+            self->config = openvpn3_setting_get_profile(s_vpn);
+            if (self->profile_is_secret && !self->config && !self->refusal)
+                self->refusal = g_strdup(LOCKED_PROFILE_MESSAGE);
+        }
         if ((value = nm_setting_vpn_get_data_item(s_vpn, OPENVPN3_KEY_USERNAME)))
             entry_set_text(self->username.entry, value);
     }
@@ -287,6 +329,16 @@ update_connection(NMVpnEditor *editor, NMConnection *connection, GError **error)
     NMSettingVpn *s_vpn;
     const char *username;
 
+    if (self->unsupported) {
+        g_set_error_literal(error, NM_CONNECTION_ERROR, NM_CONNECTION_ERROR_INVALID_PROPERTY,
+                            self->unsupported);
+        return FALSE;
+    }
+    if (self->refusal) {
+        g_set_error_literal(error, NM_CONNECTION_ERROR, NM_CONNECTION_ERROR_MISSING_PROPERTY,
+                            self->refusal);
+        return FALSE;
+    }
     if (!self->config) {
         g_set_error_literal(error, NM_CONNECTION_ERROR, NM_CONNECTION_ERROR_MISSING_PROPERTY,
                             OPENVPN3_KEY_PROFILE);
@@ -298,7 +350,17 @@ update_connection(NMVpnEditor *editor, NMConnection *connection, GError **error)
 
     s_vpn = NM_SETTING_VPN(nm_setting_vpn_new());
     g_object_set(s_vpn, NM_SETTING_VPN_SERVICE_TYPE, OPENVPN3_SERVICE_TYPE, NULL);
-    openvpn3_setting_set_profile(s_vpn, self->config);
+    /* Keep the layout the connection already uses: this editor has no way to
+     * offer the choice, and silently publishing a profile that was a secret
+     * would put private keys back into the connection file. */
+    if (self->profile_is_secret) {
+        if (!openvpn3_setting_set_profile_secret(s_vpn, self->config, self->profile_flags, error)) {
+            g_object_unref(s_vpn);
+            return FALSE;
+        }
+    } else {
+        openvpn3_setting_set_profile(s_vpn, self->config);
+    }
 
     if (p->needs_user_pass) {
         username = entry_get_text(self->username.entry);
@@ -327,6 +389,8 @@ dispose(GObject *object)
 
     g_clear_object(&self->root);
     g_clear_pointer(&self->config, g_free);
+    g_clear_pointer(&self->unsupported, g_free);
+    g_clear_pointer(&self->refusal, g_free);
     G_OBJECT_CLASS(openvpn3_editor_parent_class)->dispose(object);
 }
 

@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 """NetworkManager VPN service plugin driving OpenVPN 3 Linux sessions."""
 
-import base64
-import binascii
 import logging
 import urllib.parse
 
@@ -13,15 +11,18 @@ from gi.repository import GLib, NM  # noqa: E402
 
 from . import desktop, ipconfig, ovpn, pki  # noqa: E402
 from . import openvpn3 as ov3  # noqa: E402
+from . import profile_storage  # noqa: E402
 from .vpnplugin import PluginError, VpnPlugin  # noqa: E402
 
 log = logging.getLogger("nm-openvpn3")
 
 SERVICE_NAME = "org.freedesktop.NetworkManager.openvpn3"
 
-# Base64: multi-line values do not survive every settings backend (netplan
-# escapes newlines twice).
-KEY_PROFILE = "profile"
+# The profile is base64: multi-line values do not survive every settings
+# backend (netplan escapes newlines twice).  It lives either in the data items
+# or, self-contained private key material and all, in the secrets; see
+# profile_storage.
+KEY_PROFILE = profile_storage.KEY_PROFILE
 KEY_USERNAME = "username"
 KEY_PASSWORD = "password"
 KEY_CHALLENGE = "challenge-response"
@@ -29,26 +30,27 @@ KEY_CERT_PASS = "cert-pass"
 
 HINT_CHALLENGE_ECHO = "x-challenge-echo"
 
+get_profile = profile_storage.get_profile
+_secret_flags = profile_storage.secret_flags
 
-def get_profile(s_vpn):
-    value = s_vpn.get_data_item(KEY_PROFILE) if s_vpn else None
-    if not value:
-        return None
-    try:
-        return base64.b64decode(value, validate=True).decode("utf-8")
-    except (binascii.Error, UnicodeDecodeError):
-        raise PluginError("BadArguments", "The stored OpenVPN profile is corrupt")
+
+def _keep(new, old):
+    """@new unless the connection did not carry the value at all."""
+    return old if new is None else new
+
+
+def require_profile(s_vpn):
+    """The profile, or a D-Bus error saying why there is none."""
+    config = get_profile(s_vpn)  # refuses an unknown profile-storage layout
+    if config:
+        return config
+    if profile_storage.missing_reason(s_vpn) == profile_storage.LOCKED:
+        raise PluginError("BadArguments", profile_storage.LOCKED_MESSAGE)
+    raise PluginError("BadArguments", "The connection has no OpenVPN profile")
 
 
 def _url_host(url):
     return urllib.parse.urlsplit(url).hostname or "?"
-
-
-def _secret_flags(s_vpn, key):
-    # NM.Setting.get_secret_flags() is not callable from Python (the out
-    # argument lacks an annotation); VPN secret flags live in the data items.
-    value = s_vpn.get_data_item(key + "-flags")
-    return NM.SettingSecretFlags(int(value)) if value else NM.SettingSecretFlags.NONE
 
 
 class Tunnel:
@@ -65,16 +67,35 @@ class Tunnel:
         self.stopping = False
         self._last_status = None
         self._sub_ids = []
+        self.config = None
+        self.username = None
+        self.password = None
+        self.challenge = None
+        self.cert_pass = None
         self.update_connection(connection)
 
     def update_connection(self, connection):
+        """Takes over what the connection carries, keeping the rest.
+
+        NewSecrets hands us whatever the agent has just produced -- a one-time
+        code, a retried passphrase -- and nothing else.  Dropping the profile
+        or the password at that point would tear down an activation that is
+        halfway through authenticating.
+
+        "Nothing else" means the key is *absent*, which is what is kept.  A
+        key that is there and empty is an answer: the user cleared the
+        password, and reusing the old one would authenticate with a credential
+        they just removed.
+        """
         s_vpn = connection.get_setting_vpn()
         self.name = connection.get_id()
-        self.config = get_profile(s_vpn)
-        self.username = s_vpn.get_data_item(KEY_USERNAME)
-        self.password = s_vpn.get_secret(KEY_PASSWORD)
-        self.challenge = s_vpn.get_secret(KEY_CHALLENGE)
-        self.cert_pass = s_vpn.get_secret(KEY_CERT_PASS)
+        self.config = _keep(get_profile(s_vpn), self.config)
+        self.username = _keep(s_vpn.get_data_item(KEY_USERNAME), self.username)
+        self.password = _keep(s_vpn.get_secret(KEY_PASSWORD), self.password)
+        self.cert_pass = _keep(s_vpn.get_secret(KEY_CERT_PASS), self.cert_pass)
+        # A one-time code is consumed once (set to None again when used); only
+        # a value the agent actually sent replaces it.
+        self.challenge = _keep(s_vpn.get_secret(KEY_CHALLENGE), self.challenge)
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -308,9 +329,8 @@ class Plugin(VpnPlugin):
 
     def do_connect(self, connection, interactive):
         s_vpn = connection.get_setting_vpn()
-        config = get_profile(s_vpn)
-        if not config:
-            raise PluginError("BadArguments", "The connection has no OpenVPN profile")
+        profile_storage.profile_flags(s_vpn)  # rejects a profile nobody stores
+        config = require_profile(s_vpn)
         if ovpn.needs_user_pass(config) and not s_vpn.get_data_item(KEY_USERNAME):
             raise PluginError("BadArguments", "The profile requires a username")
         self.tunnel = Tunnel(self, self.client_factory(), connection, interactive)
@@ -318,7 +338,12 @@ class Plugin(VpnPlugin):
 
     def do_need_secrets(self, connection):
         s_vpn = connection.get_setting_vpn()
+        profile_storage.profile_flags(s_vpn)  # rejects a profile nobody stores
         config = get_profile(s_vpn) or ""
+        if profile_storage.missing_reason(s_vpn) == profile_storage.LOCKED:
+            # Which credentials are needed is a property of the profile, so
+            # there is nothing sensible to ask for until we have it.
+            return NM.SETTING_VPN_SETTING_NAME
 
         def missing(key):
             return not s_vpn.get_secret(key) \

@@ -9,8 +9,6 @@ dialog asks and the secrets are written to stdout as key/value lines.
 """
 
 import argparse
-import base64
-import binascii
 import os
 import sys
 import time
@@ -22,26 +20,62 @@ sys.path.insert(0, "@pkgdatadir@")
 gi.require_version("NM", "1.0")
 from gi.repository import GLib, NM  # noqa: E402
 
-from nm_openvpn3 import pki  # noqa: E402
+from nm_openvpn3 import ovpn, pki  # noqa: E402
+from nm_openvpn3 import profile_storage as ps  # noqa: E402
+from nm_openvpn3.vpnplugin import PluginError  # noqa: E402
 
+# The storage contract lives in nm_openvpn3.profile_storage; this prompt reads
+# it through the same helpers the service does, so the two cannot drift.
+KEY_PROFILE = ps.KEY_PROFILE
+KEY_PROFILE_STORAGE = ps.KEY_PROFILE_STORAGE
+STORAGE_SECRET = ps.STORAGE_SECRET
 KEY_PASSWORD = "password"
 KEY_CHALLENGE = "challenge-response"
 KEY_CERT_PASS = "cert-pass"
 HINT_MESSAGE = "x-vpn-message:"
 HINT_CHALLENGE_ECHO = "x-challenge-echo"
 
+LOCKED_PROFILE_MESSAGE = (
+    "The OpenVPN profile of this connection is kept with its secrets and was not "
+    "available. Unlock the wallet or keyring and try again, or load the profile "
+    "again in the connection editor — no password typed here can replace it."
+)
+UNSUPPORTED_PROFILE_MESSAGE = (
+    "This connection stores its OpenVPN profile in a layout this version does not "
+    "know, so there is no way to tell which credentials it needs. Update "
+    "network-manager-openvpn3."
+)
+_UNAVAILABLE = {ps.LOCKED: LOCKED_PROFILE_MESSAGE, ps.UNSUPPORTED: UNSUPPORTED_PROFILE_MESSAGE}
 
-def decode_profile(profile_b64):
+
+def profile_of(data, secrets):
+    """The connection's profile and why there is none (see profile_storage).
+
+    The profile is never prompted for and never written back: it is the secret
+    agent that holds it.  A leftover public copy is deliberately ignored in
+    secret mode and in any layout this version does not know -- it is stale by
+    definition.
+    """
+    stored, reason = ps.stored_profile(data.get, secrets.get)
+    if not stored:
+        return None, reason
     try:
-        return base64.b64decode(profile_b64 or "", validate=True).decode("utf-8")
-    except (binascii.Error, UnicodeDecodeError):
-        return None
+        return ps.decode(stored), None
+    except PluginError:
+        # The service reports the corrupt profile; here it only means "cannot
+        # tell what is needed", same as a legacy connection without one.
+        return None, ps.ABSENT
+
+
+def profile_unavailable(data, secrets):
+    """True when the profile itself is what is missing, not a credential."""
+    return profile_of(data, secrets)[1] in _UNAVAILABLE
 
 
 def needs_user_pass(config):
     if config is None:
         return True  # cannot tell: ask rather than fail silently
-    return any(line.strip() == "auth-user-pass" for line in config.splitlines())
+    return ovpn.needs_user_pass(config)
 
 
 def needs_cert_pass(config):
@@ -54,9 +88,16 @@ def needs_cert_pass(config):
 
 
 def secret_flags(data, key):
+    """Flags of @key; NONE when the stored value is not a flags value.
+
+    The service refuses such a connection with a D-Bus error, so this prompt
+    only has to not make it worse: NONE means "ask, and let it be saved",
+    while trusting the number would turn -1 into NotRequired and skip the
+    field altogether.
+    """
     try:
-        return NM.SettingSecretFlags(int(data.get(key + "-flags", "0")))
-    except ValueError:
+        return ps.parse_flags(data.get(key + "-flags", "0"), key)
+    except PluginError:
         return NM.SettingSecretFlags.NONE
 
 
@@ -99,7 +140,12 @@ def plan(data, secrets, hints, retry):
         # The service found the stored passphrase wrong or missing.
         return message, [Field(KEY_CERT_PASS, "Private key passphrase", "", True)]
 
-    config = decode_profile(data.get("profile"))
+    config, reason = profile_of(data, secrets)
+    if reason in _UNAVAILABLE:
+        # Which credentials a connection needs is a property of its profile.
+        # With the profile out of reach, a password prompt would be guesswork;
+        # say what is actually wrong instead.
+        return message or _UNAVAILABLE[reason], []
     fields = []
     for key, label, needed in ((KEY_PASSWORD, "Password", needs_user_pass(config)),
                                (KEY_CERT_PASS, "Private key passphrase", needs_cert_pass(config))):
@@ -219,6 +265,11 @@ def main():
     if args.external_ui_mode:
         external_ui(args.name, message, fields)
         return
+
+    if not fields and profile_unavailable(data, secrets):
+        # Handing back an empty answer would just make NetworkManager retry
+        # and the service report its own generic failure.
+        sys.exit(message)
 
     values = {f.key: f.value for f in fields if f.value}
     if any(f.should_ask for f in fields):

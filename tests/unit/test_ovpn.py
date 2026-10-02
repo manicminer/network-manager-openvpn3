@@ -37,3 +37,45 @@ def test_static_challenge():
     sc = ovpn.static_challenge(PROFILE)
     assert sc == ovpn.StaticChallenge("Enter OTP", True)
     assert ovpn.static_challenge("client\n") is None
+
+
+# -- <connection> is a scope of options, not an opaque payload ----------------
+
+BLOCKS = """\
+client
+<connection>
+remote vpn1.example.net 1194 udp
+<ca>
+-----BEGIN CERTIFICATE-----
+remote not-a-directive.example.com
+-----END CERTIFICATE-----
+</ca>
+</connection>
+<connection>
+remote vpn2.example.net 443 tcp
+auth-user-pass
+static-challenge "Enter OTP" 1
+</connection>
+"""
+
+
+def test_directives_inside_a_connection_block_are_directives():
+    assert ovpn.first_remote(BLOCKS) == ("vpn1.example.net", "1194")
+    assert ovpn.needs_user_pass(BLOCKS)
+    assert ovpn.static_challenge(BLOCKS) == ovpn.StaticChallenge("Enter OTP", True)
+
+
+def test_inline_payloads_nested_in_a_connection_block_stay_opaque():
+    assert [name for name, _ in ovpn._directives(BLOCKS)].count("ca") == 1
+    assert ovpn.first_remote(BLOCKS) != ("not-a-directive.example.com", None)
+
+
+def test_a_connection_block_is_still_reported_as_a_block():
+    names = [name for name, _ in ovpn._directives(BLOCKS)]
+    assert names.count("connection") == 2
+
+
+def test_an_unmatched_closing_tag_is_kept_as_a_directive():
+    # Nothing here validates profiles; an odd line must survive as itself.
+    assert [name for name, _ in ovpn._directives("client\n</connection>\n")] \
+        == ["client", "</connection>"]

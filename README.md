@@ -81,7 +81,12 @@ After that the connection is in the VPN menu of Quick Settings.
 
 - Files referenced by the profile (`ca`, `cert`, `key`, `tls-auth`,
   `tls-crypt`, `auth-user-pass` …) are read once at import and stored inside
-  the connection, the original files are no longer needed.
+  the connection, the original files are no longer needed. This includes file
+  references inside `<connection>` blocks, which are a scope of options and
+  not an opaque payload: a profile whose only `remote` lives in one imports
+  normally. Directive order, repeated directives, repeated `<connection>`
+  blocks, quoting, comments and directives this plugin has never heard of are
+  all preserved — there is no list of allowed directives.
 - Credentials in the profile (an inline `<auth-user-pass>` block or the file
   it points to) move into the connection: the username as data, the password
   as a NetworkManager secret. Without them the password is agent-owned: GNOME
@@ -100,13 +105,99 @@ After that the connection is in the VPN menu of Quick Settings.
   passphrase of an encrypted key or bundle is a NetworkManager secret
   ("Private key passphrase"), asked for by GNOME and optionally kept in the
   keyring.
-- Exported profiles contain no credentials.
+- Export (`nmcli connection export`, and the editors) writes the profile back
+  out as it is stored: passwords and passphrases are **not** in it — they
+  stayed in NetworkManager and the exported profile asks for them again — but
+  the certificates, private keys and shared TLS keys that were inlined at
+  import **are**, because they are part of the profile. The file is therefore
+  created `0600`, and an existing file at that path is replaced along with its
+  permissions. A connection that keeps its profile with its secrets refuses to
+  export at all (see below).
+
+### Where the profile is stored
+
+A profile is self-contained: certificates, private keys and shared TLS keys
+are inlined into it at import. By default it is kept in `vpn.data`. The
+keyfile of a system connection is root-owned and `0600` — the concern is not
+the file but that `vpn.data` is ordinary connection data, which NetworkManager
+hands to every client allowed to read the connection's settings, and which
+lives in whatever settings backend the distribution uses. Secrets are gated
+instead: they go to the owning agent, or to a caller that asks for secrets
+specifically. So a front-end may give NetworkManager the **whole profile as a
+secret**, so that the secret agent (KWallet, the GNOME keyring) keeps it, or
+NetworkManager itself owns it for unattended activation.
+
+The two layouts are mutually exclusive:
+
+| | `vpn.data` | `vpn.secrets` |
+| --- | --- | --- |
+| legacy | `profile` = base64 profile | — |
+| secret | `profile-storage` = `secret`, `profile-flags` = `1` (agent-owned) or `0` (system-owned) | `profile` = base64 profile |
+
+`profile-flags` is nothing special: NetworkManager keeps the flags of a VPN
+secret `x` in `vpn.data["x-flags"]`, so it is simply the flags key of the
+`profile` secret. It follows that **absent `profile-flags` mean `0`** — what
+absent flags mean to NetworkManager, i.e. system-owned. A reader must not
+read them as agent-owned: that would move the profile of an unattended
+connection into a user's wallet the first time anything saved it. A writer
+that wants the wallet writes `1` explicitly, which is what new profiles get.
+
+Why the whole profile rather than a list of sensitive directives: there is no
+whitelist to get wrong, unknown sensitive directives are covered too, and
+nothing has to be taken apart and put back together.
+
+Rules a client must follow:
+
+- In secret mode `vpn.data["profile"]` is **removed**. Never leave a public
+  copy behind and never read one in secret mode: it is stale by definition.
+  A client that predates this layout therefore finds no profile and fails
+  closed instead of connecting with an outdated one.
+- A `profile-storage` value other than `secret` (and other than absent or
+  empty, which mean the legacy layout) is a layout the reader does not know.
+  **Fail closed**: the `profile` data item belongs to whatever layout the
+  connection used before, so it must not be read, written back, exported, or
+  reclassified as legacy on edit. The service refuses such a connection, the
+  importer's reader returns no profile, the editors refuse to save it and say
+  why, and export refuses.
+- `profile-flags` may only be `0` or `1`. `NotSaved` / `NotRequired` would
+  describe a profile nobody could ever reconstruct and are rejected — as is
+  anything that is not one of those two numbers. Rejecting means reporting an
+  error, never saving the connection with the profile dropped.
+- Never fall back to writing the profile into `vpn.data` because the wallet
+  was unavailable. Report the failure instead.
+- `NeedSecrets` asks for the profile first when it is not available: which
+  credentials a connection needs is a property of the profile. For the same
+  reason the auth dialog does not offer a password prompt for a connection
+  whose profile it could not read; it explains that the profile is unavailable.
+- `profile-storage` tells "the profile is locked or the agent is gone" apart
+  from "this connection has no profile".
+
+Implementations: `src/nm_openvpn3/profile_storage.py` — `stored_profile()` is
+the one place that decides which layout a connection uses, shared by the
+service and the auth dialog — and `openvpn3_setting_get_profile()` /
+`openvpn3_setting_profile_flags()` / `openvpn3_setting_set_profile_secret()`
+in `properties/ovpn-import.c` (libnm plugin, GTK editors).
+
+Import always produces the legacy layout, so existing clients keep working; a
+front-end that offers the choice migrates the connection before saving it.
 
 ### Editors
 
 - **GNOME Settings** uses the GTK 4 editor, **nm-connection-editor** the
   GTK 3 one; both come with `network-manager-openvpn3-gnome`. They load a
   profile from a file and edit the username and the stored secrets.
+- Those two editors do not offer a choice of profile storage; they keep
+  whatever layout the connection already uses. If the profile is a secret and
+  was not handed to the editor, it refuses to save rather than overwrite it,
+  and exporting such a connection is refused rather than writing private key
+  material to a plain file. They refuse the same way, with the reason on the
+  page, for a connection whose `profile-flags` would never store the profile,
+  and for a `profile-storage` layout they do not know — in the first case
+  loading a profile from a file repairs the connection (and stores it
+  agent-owned, like any new profile), in the second nothing does, because
+  saving would have to reclassify a layout they cannot read.
+- **Plasma** has a native editor in plasma-nm which does offer the choice
+  (wallet or system storage) and edits the profile itself.
 
 ### Limitation: PKCS#11
 
@@ -138,8 +229,9 @@ openvpn3 implements it.
   `sudo openvpn3-admin netcfg-service --config-set systemd-resolved 1`.
 - Sessions belong to root; `sudo openvpn3 sessions-list` shows them.
 - The profile is stored base64-encoded in the connection (`vpn.data`
-  key `profile`): some NetworkManager settings backends (netplan on Ubuntu)
-  do not keep multi-line values intact.
+  key `profile`, or the `profile` secret — see *Where the profile is
+  stored*): some NetworkManager settings backends (netplan on Ubuntu) do not
+  keep multi-line values intact.
 
 Logs: `journalctl -u NetworkManager | grep nm-openvpn3`.
 

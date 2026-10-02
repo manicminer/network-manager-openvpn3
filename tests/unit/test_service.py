@@ -9,12 +9,22 @@ from gi.repository import GLib, NM  # noqa: E402
 
 from nm_openvpn3 import ipconfig, service  # noqa: E402
 from nm_openvpn3 import openvpn3 as ov3  # noqa: E402
+from nm_openvpn3 import profile_storage as ps  # noqa: E402
 
 PROFILE = "client\ndev tun\nremote vpn.example.net 1194\nauth-user-pass\n"
+CERT_PROFILE = "client\ndev tun\nremote vpn.example.net 1194\n"
 SESSION_PATH = "/net/openvpn/v3/sessions/test0"
 
 
-def make_connection(password="s3cret", username="testuser", config=PROFILE, cert_pass=None):
+def make_connection(password="s3cret", username="testuser", config=PROFILE, cert_pass=None,
+                    challenge=None, storage="data", profile_flags="1"):
+    """A VPN connection.
+
+    @storage picks the profile layout: "data" is the legacy public profile,
+    "secret" the one where the whole profile is a NetworkManager secret; any
+    other value is written as the profile-storage marker verbatim.
+    @config None leaves the profile unavailable (in secret mode: locked).
+    """
     con = NM.SimpleConnection.new()
     s_con = NM.SettingConnection.new()
     s_con.set_property(NM.SETTING_CONNECTION_ID, "test-vpn")
@@ -22,15 +32,32 @@ def make_connection(password="s3cret", username="testuser", config=PROFILE, cert
     con.add_setting(s_con)
     s_vpn = NM.SettingVpn.new()
     s_vpn.set_property(NM.SETTING_VPN_SERVICE_TYPE, service.SERVICE_NAME)
-    s_vpn.add_data_item(service.KEY_PROFILE, base64.b64encode(config.encode()).decode())
+    if storage != "data":
+        s_vpn.add_data_item(ps.KEY_PROFILE_STORAGE, storage)
+        if profile_flags is not None:
+            s_vpn.add_data_item(ps.KEY_PROFILE_FLAGS, profile_flags)
+        if config is not None:
+            s_vpn.add_secret(ps.KEY_PROFILE, base64.b64encode(config.encode()).decode())
+    elif config is not None:
+        s_vpn.add_data_item(service.KEY_PROFILE, base64.b64encode(config.encode()).decode())
     if username:
         s_vpn.add_data_item(service.KEY_USERNAME, username)
     if password:
         s_vpn.add_secret(service.KEY_PASSWORD, password)
     if cert_pass:
         s_vpn.add_secret(service.KEY_CERT_PASS, cert_pass)
+    if challenge:
+        s_vpn.add_secret(service.KEY_CHALLENGE, challenge)
     con.add_setting(s_vpn)
     return con
+
+
+def bare_plugin():
+    """A Plugin without the D-Bus machinery; enough for the pure decisions."""
+    plugin = service.Plugin.__new__(service.Plugin)
+    plugin.client_factory = FakeClient
+    plugin.tunnel = None
+    return plugin
 
 
 class FakeBus:
@@ -343,3 +370,187 @@ def test_pk_passphrase_slot_is_answered():
     client.session.need_creds = True
     status(client, ov3.MAJOR_CONNECTION, ov3.CFG_REQUIRE_USER)
     assert client.session.provided == {0: "testuser", 1: "s3cret", 2: "keypass"}
+
+
+# -- the profile as a NetworkManager secret -----------------------------------
+
+
+def test_connect_uses_the_secret_profile():
+    t, client, plugin = start(make_connection(storage="secret"))
+    assert client.imported == [("test-vpn", PROFILE)]
+
+
+def test_connect_without_the_secret_profile_fails_closed():
+    plugin = bare_plugin()
+    with pytest.raises(service.PluginError) as e:
+        plugin.do_connect(make_connection(config=None, storage="secret"), interactive=False)
+    assert "secret" in str(e.value)
+    assert plugin.tunnel is None
+
+
+def test_connect_without_any_profile_still_reports_the_old_error():
+    plugin = bare_plugin()
+    with pytest.raises(service.PluginError, match="no OpenVPN profile"):
+        plugin.do_connect(make_connection(config=None), interactive=False)
+
+
+def test_connect_rejects_a_profile_that_is_never_stored():
+    plugin = bare_plugin()
+    with pytest.raises(service.PluginError):
+        plugin.do_connect(make_connection(storage="secret", profile_flags="2"), interactive=False)
+
+
+def test_need_secrets_asks_for_the_locked_profile_first():
+    # Everything else is already there and the profile would not even need a
+    # password: the profile is still what is missing.
+    con = make_connection(config=None, storage="secret", password="s3cret")
+    assert bare_plugin().do_need_secrets(con) == NM.SETTING_VPN_SETTING_NAME
+
+
+def test_need_secrets_then_uses_the_reconstructed_profile():
+    plugin = bare_plugin()
+    assert plugin.do_need_secrets(make_connection(storage="secret")) is None
+    assert plugin.do_need_secrets(
+        make_connection(storage="secret", password=None)) == NM.SETTING_VPN_SETTING_NAME
+    assert plugin.do_need_secrets(
+        make_connection(storage="secret", config=CERT_PROFILE, password=None)) is None
+
+
+def test_need_secrets_is_unchanged_for_legacy_profiles():
+    plugin = bare_plugin()
+    assert plugin.do_need_secrets(make_connection()) is None
+    assert plugin.do_need_secrets(make_connection(password=None)) == NM.SETTING_VPN_SETTING_NAME
+
+
+def test_need_secrets_reports_a_corrupt_secret_profile():
+    con = make_connection(storage="secret")
+    con.get_setting_vpn().add_secret(ps.KEY_PROFILE, "@@ not base64 @@")
+    with pytest.raises(service.PluginError, match="corrupt"):
+        bare_plugin().do_need_secrets(con)
+
+
+def test_challenge_round_trip_keeps_the_secret_profile():
+    t, client, plugin = start(make_connection(storage="secret"), interactive=True)
+    client.session.inputs = list(USERPASS) + [
+        (ov3.ATTN_CREDENTIALS, ov3.GRP_CHALLENGE_DYNAMIC, 2, "dynamic_challenge", "Enter PIN", False)]
+    client.session.need_creds = True
+    status(client, ov3.MAJOR_CONNECTION, ov3.CFG_REQUIRE_USER)
+    assert [e for e in plugin.events if e[0] == "secrets"]
+
+    # NetworkManager hands back only what the agent just produced.
+    only_challenge = make_connection(config=None, storage="secret", password=None,
+                                     username=None, challenge="123456")
+    t.new_secrets(only_challenge)
+    assert t.config == PROFILE
+    assert client.session.provided == {0: "testuser", 1: "s3cret", 2: "123456"}
+
+
+def test_a_later_secrets_round_does_not_blank_the_legacy_profile():
+    t, client, plugin = start(make_connection(), interactive=True)
+    t.new_secrets(make_connection(config=None, password=None, username=None, challenge="1"))
+    assert t.config == PROFILE
+    assert t.username == "testuser"
+    assert t.password == "s3cret"
+
+
+# -- a storage layout this version does not know ------------------------------
+
+
+def test_connect_refuses_an_unknown_profile_storage():
+    con = make_connection(storage="v2-whatever", profile_flags=None)
+    # A leftover public copy from before the connection moved: using it would
+    # connect with a stale profile.
+    con.get_setting_vpn().add_data_item(service.KEY_PROFILE,
+                                        base64.b64encode(b"client\nremote stale 1\n").decode())
+    plugin = bare_plugin()
+    with pytest.raises(service.PluginError) as e:
+        plugin.do_connect(con, interactive=False)
+    assert "v2-whatever" in str(e.value)
+    assert plugin.tunnel is None
+
+
+def test_need_secrets_refuses_an_unknown_profile_storage():
+    con = make_connection(storage="v2-whatever", profile_flags=None)
+    with pytest.raises(service.PluginError, match="v2-whatever"):
+        bare_plugin().do_need_secrets(con)
+
+
+def test_need_secrets_reports_bad_secret_flags_instead_of_crashing():
+    # An unguarded int() here would leave the D-Bus call without a reply.
+    con = make_connection(password=None)
+    con.get_setting_vpn().add_data_item("password-flags", "nonsense")
+    with pytest.raises(service.PluginError) as e:
+        bare_plugin().do_need_secrets(con)
+    assert e.value.name == "BadArguments"
+
+
+# -- what a later secrets round may and may not overwrite ---------------------
+
+
+def test_an_explicitly_empty_credential_is_not_the_old_one():
+    # The user cleared the password; "keep the previous value unless a new one
+    # arrives" must mean "unless the key is absent", not "unless it is empty".
+    t, client, plugin = start(make_connection(), interactive=True)
+    con = make_connection(password=None, username=None, config=None)
+    con.get_setting_vpn().add_secret(service.KEY_PASSWORD, "")
+    t.new_secrets(con)
+    assert t.password == ""
+    assert t.config == PROFILE
+    assert t.username == "testuser"
+
+
+def test_an_absent_credential_keeps_the_previous_one():
+    t, client, plugin = start(make_connection(cert_pass="keypass"), interactive=True)
+    t.new_secrets(make_connection(config=None, password=None, username=None))
+    assert t.password == "s3cret"
+    assert t.cert_pass == "keypass"
+
+
+def test_a_consumed_one_time_code_is_not_replayed():
+    t, client, plugin = start(make_connection(challenge="123456"), interactive=True)
+    client.session.inputs = list(USERPASS) + [
+        (ov3.ATTN_CREDENTIALS, ov3.GRP_CHALLENGE_DYNAMIC, 2, "dynamic_challenge", "Enter PIN", False)]
+    client.session.need_creds = True
+    status(client, ov3.MAJOR_CONNECTION, ov3.CFG_REQUIRE_USER)
+    assert client.session.provided[2] == "123456"
+    assert t.challenge is None
+
+    # A second round of secrets without a fresh code must not reuse the old
+    # one: the server has already seen it.
+    client.session.provided.pop(2)
+    t.new_secrets(make_connection(config=None, password=None, username=None))
+    assert t.challenge is None
+    assert 2 not in client.session.provided
+    assert [e for e in plugin.events if e[0] == "secrets"]
+
+
+# -- profiles that keep their remote in a <connection> block ------------------
+
+BLOCK_PROFILE = ("client\n<connection>\nremote vpn.example.net 1194 udp\n"
+                 "auth-user-pass\n</connection>\n")
+
+
+def test_connect_handles_a_profile_whose_options_are_in_a_connection_block():
+    t, client, plugin = start(make_connection(config=BLOCK_PROFILE))
+    assert client.imported == [("test-vpn", BLOCK_PROFILE)]
+
+
+def test_a_username_is_still_required_when_auth_is_in_a_connection_block():
+    plugin = bare_plugin()
+    with pytest.raises(service.PluginError, match="username"):
+        plugin.do_connect(make_connection(config=BLOCK_PROFILE, username=None), interactive=False)
+
+
+def test_need_secrets_sees_auth_user_pass_in_a_connection_block():
+    plugin = bare_plugin()
+    assert plugin.do_need_secrets(
+        make_connection(config=BLOCK_PROFILE, password=None)) == NM.SETTING_VPN_SETTING_NAME
+    assert plugin.do_need_secrets(make_connection(config=BLOCK_PROFILE)) is None
+
+
+def test_an_explicitly_empty_one_time_code_is_not_the_old_one():
+    t, client, plugin = start(make_connection(challenge="123456"), interactive=True)
+    con = make_connection(config=None, password=None, username=None)
+    con.get_setting_vpn().add_secret(service.KEY_CHALLENGE, "")
+    t.new_secrets(con)
+    assert t.challenge == ""

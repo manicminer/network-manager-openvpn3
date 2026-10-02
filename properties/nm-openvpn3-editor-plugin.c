@@ -6,8 +6,12 @@
 
 #define _GNU_SOURCE
 #include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <gio/gio.h>
+#include <glib/gstdio.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "ovpn-import.h"
 
@@ -53,18 +57,96 @@ import_from_file(NMVpnEditorPlugin *plugin, const char *path, GError **error)
     return openvpn3_connection_from_profile(p, base);
 }
 
+/* Writes @text to @path as a file only its owner can read.
+ *
+ * An exported profile is self-contained, so it carries whatever certificates,
+ * private keys and shared TLS keys were inlined into it at import.
+ * g_file_set_contents() would leave that at the process umask, typically
+ * 0644, and would leave an already existing file at whatever mode it had.
+ *
+ * So the contents go into a fresh 0600 file in the same directory, which is
+ * then renamed over @path.  Renaming replaces a symlink sitting at @path
+ * rather than writing through it into whatever it points at, replaces an
+ * existing file's permissions along with its contents, and never leaves a
+ * half written profile where the old one was. */
+static gboolean
+write_private(const char *path, const char *text, GError **error)
+{
+    g_autofree char *dir  = g_path_get_dirname(path);
+    g_autofree char *tmp  = g_build_filename(dir, ".nm-openvpn3-export-XXXXXX", NULL);
+    const char      *left = text;
+    gsize            todo = strlen(text);
+    int              fd, errsv;
+
+    fd = g_mkstemp_full(tmp, O_WRONLY | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        errsv = errno;
+        g_set_error(error, G_FILE_ERROR, g_file_error_from_errno(errsv),
+                    "Cannot write the profile next to %s: %s", path, g_strerror(errsv));
+        return FALSE;
+    }
+    while (todo > 0) {
+        gssize written = write(fd, left, todo);
+
+        if (written < 0) {
+            if (errno == EINTR)
+                continue;
+            errsv = errno;
+            close(fd);
+            g_unlink(tmp);
+            g_set_error(error, G_FILE_ERROR, g_file_error_from_errno(errsv),
+                        "Cannot write the profile to %s: %s", path, g_strerror(errsv));
+            return FALSE;
+        }
+        left += written;
+        todo -= written;
+    }
+    if (close(fd) != 0 || g_rename(tmp, path) != 0) {
+        errsv = errno;
+        g_unlink(tmp);
+        g_set_error(error, G_FILE_ERROR, g_file_error_from_errno(errsv),
+                    "Cannot write the profile to %s: %s", path, g_strerror(errsv));
+        return FALSE;
+    }
+    return TRUE;
+}
+
 static gboolean
 export_to_file(NMVpnEditorPlugin *plugin, const char *path, NMConnection *connection, GError **error)
 {
-    g_autofree char *config = openvpn3_setting_get_profile(nm_connection_get_setting_vpn(connection));
+    NMSettingVpn    *s_vpn  = nm_connection_get_setting_vpn(connection);
+    g_autofree char *config = NULL;
+
+    /* A profile kept with the secrets is there precisely so that its inlined
+     * private keys never reach a plain file.  Writing it out would undo that
+     * silently, so refuse rather than guess what the user meant. */
+    if (openvpn3_setting_profile_is_secret(s_vpn)) {
+        g_set_error_literal(error, NM_CONNECTION_ERROR, NM_CONNECTION_ERROR_FAILED,
+                            "This connection keeps its profile with its secrets. Exporting it "
+                            "would write the private key material to a plain file, so export "
+                            "is refused.");
+        return FALSE;
+    }
+    /* A layout this build does not know: the profile data item belongs to
+     * whatever the connection used before it, so exporting it would write out
+     * a stale profile and quietly present it as the current one. */
+    if (openvpn3_setting_profile_storage_is_unsupported(s_vpn)) {
+        g_autofree char *why = openvpn3_setting_unsupported_storage_message(s_vpn);
+
+        g_set_error_literal(error, NM_CONNECTION_ERROR, NM_CONNECTION_ERROR_INVALID_PROPERTY, why);
+        return FALSE;
+    }
+    config = openvpn3_setting_get_profile(s_vpn);
 
     if (!config) {
         g_set_error_literal(error, NM_CONNECTION_ERROR, NM_CONNECTION_ERROR_MISSING_PROPERTY,
                             "The connection has no OpenVPN profile");
         return FALSE;
     }
-    /* Credentials stay in NetworkManager, the exported profile asks for them. */
-    return g_file_set_contents(path, config, -1, error);
+    /* Passwords and passphrases stay in NetworkManager and the exported
+     * profile asks for them again; the key material inlined at import is part
+     * of the profile and is written out with it, hence the 0600 file. */
+    return write_private(path, config, error);
 }
 
 static char *

@@ -102,3 +102,112 @@ def test_plan_asks_for_key_passphrase():
 def test_plan_cert_pass_hint():
     _, fields = ad.plan({"profile": PROFILE}, {}, ["cert-pass"], False)
     assert [f.key for f in fields] == ["cert-pass"]
+
+
+# -- the profile stored as a secret ------------------------------------------
+
+SECRET_DATA = {"profile-storage": "secret", "profile-flags": "1"}
+
+
+def test_plan_reads_the_profile_from_the_secrets():
+    from pkihelp import pem_key
+    body = f"client\nremote vpn.example.net\n<key>\n{pem_key(b'k')}</key>\n"
+    data = dict(SECRET_DATA, **{"cert-pass-flags": "1"})
+    _, fields = ad.plan(data, {"profile": base64.b64encode(body.encode()).decode()}, [], False)
+    assert [(f.key, f.should_ask) for f in fields] == [("cert-pass", True)]
+
+
+def test_plan_explains_a_locked_profile_instead_of_asking():
+    # Which credentials this connection needs is a property of the profile,
+    # so with the profile locked there is nothing sensible to type in here.
+    msg, fields = ad.plan(SECRET_DATA, {}, [], False)
+    assert fields == []
+    assert "profile" in msg.lower()
+    assert "wallet" in msg.lower() or "keyring" in msg.lower()
+
+
+def test_plan_ignores_a_stale_public_profile_in_secret_mode():
+    # The data item is left over from before the connection moved to the
+    # keyring; it must not be the stale profile that decides what to ask for.
+    data = dict(SECRET_DATA, profile=CERT_ONLY)
+    msg, fields = ad.plan(data, {}, [], False)
+    assert fields == []
+    assert "profile" in msg.lower()
+
+
+def test_plan_still_prompts_when_the_service_asked_for_a_named_secret():
+    # A locked profile does not stop the retry the service asked for.
+    _, fields = ad.plan(SECRET_DATA, {}, ["cert-pass"], False)
+    assert [f.key for f in fields] == ["cert-pass"]
+    _, fields = ad.plan(SECRET_DATA, {}, ["challenge-response"], False)
+    assert [f.key for f in fields] == ["challenge-response"]
+
+
+def test_plan_explains_an_unknown_storage_layout():
+    msg, fields = ad.plan({"profile-storage": "v2-whatever", "profile": PROFILE}, {}, [], False)
+    assert fields == []
+    assert "profile" in msg.lower()
+    assert ad.profile_unavailable({"profile-storage": "v2-whatever", "profile": PROFILE}, {})
+
+
+def test_an_unavailable_profile_is_not_echoed_in_the_explanation(capsys):
+    msg, fields = ad.plan(SECRET_DATA, {"profile": PROFILE}, [], False)
+    ad.external_ui("office", msg, fields)
+    assert PROFILE not in capsys.readouterr().out
+
+
+def test_profile_unavailable_is_false_once_the_profile_is_there():
+    assert not ad.profile_unavailable(SECRET_DATA, {"profile": PROFILE})
+    assert not ad.profile_unavailable({"profile": PROFILE}, {})
+    # A legacy connection with no profile at all is a different problem; the
+    # prompt still asks, as it always did.
+    assert not ad.profile_unavailable({}, {})
+
+
+def test_plan_never_asks_for_the_profile_itself():
+    _, fields = ad.plan(SECRET_DATA, {"profile": PROFILE}, [], False)
+    assert "profile" not in [f.key for f in fields]
+
+
+def test_the_profile_is_not_echoed_back(capsys):
+    _, fields = ad.plan(SECRET_DATA, {"profile": PROFILE, "password": "pw"}, [], False)
+    ad.external_ui("office", None, fields)
+    assert PROFILE not in capsys.readouterr().out
+
+
+def test_plan_still_reads_a_legacy_profile_from_the_data():
+    assert ad.plan({"profile": CERT_ONLY}, {}, [], False) == (None, [])
+
+
+# -- shared contract helpers --------------------------------------------------
+
+
+def test_the_helper_uses_the_shared_storage_contract():
+    from nm_openvpn3 import profile_storage as ps
+    assert ad.KEY_PROFILE == ps.KEY_PROFILE
+    assert ad.KEY_PROFILE_STORAGE == ps.KEY_PROFILE_STORAGE
+    assert ad.STORAGE_SECRET == ps.STORAGE_SECRET
+
+
+def test_auth_inspection_sees_inside_a_connection_block():
+    body = ("client\n<connection>\nremote vpn.example.net 1194 udp\n"
+            "auth-user-pass\n</connection>\n")
+    data = {"profile": base64.b64encode(body.encode()).decode()}
+    _, fields = ad.plan(data, {}, [], False)
+    assert [f.key for f in fields] == ["password"]
+
+
+def test_auth_inspection_ignores_text_inside_an_inline_payload():
+    body = ("client\nremote vpn.example.net\n<ca>\n-----BEGIN CERTIFICATE-----\n"
+            "auth-user-pass\n-----END CERTIFICATE-----\n</ca>\n")
+    data = {"profile": base64.b64encode(body.encode()).decode()}
+    assert ad.plan(data, {}, [], False) == (None, [])
+
+
+def test_bad_secret_flags_do_not_turn_into_every_flag():
+    # NM.SettingSecretFlags(-1) is every flag, NotRequired included, which
+    # would silently skip the field instead of asking for it.
+    _, fields = ad.plan({"profile": PROFILE, "password-flags": "-1"}, {}, [], False)
+    assert [f.key for f in fields] == ["password"]
+    _, fields = ad.plan({"profile": PROFILE, "password-flags": "nonsense"}, {}, [], False)
+    assert [f.key for f in fields] == ["password"]

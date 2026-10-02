@@ -128,3 +128,124 @@ def test_editor_key_passphrase_for_pkcs12(plugin):
     s_out = out.get_setting_vpn()
     assert s_out.get_data_item("username") is None
     assert s_out.get_data_item("cert-pass-flags") == "1"
+
+
+# -- profiles kept with the connection's secrets ------------------------------
+
+
+def secret_connection(flags="1", with_secret=True, profile=PROFILE):
+    con = connection()
+    s_vpn = con.get_setting_vpn()
+    s_vpn.remove_data_item("profile")
+    s_vpn.add_data_item("profile-storage", "secret")
+    s_vpn.add_data_item("profile-flags", flags)
+    if with_secret:
+        s_vpn.add_secret("profile", base64.b64encode(profile.encode()).decode())
+    return con
+
+
+def test_editor_reads_a_profile_from_the_secrets(plugin):
+    editor = plugin.get_editor(secret_connection())
+    assert "vpn.example.net" in labels(editor.get_widget())
+
+
+def test_editor_keeps_the_secret_layout_and_flags(plugin):
+    for flags in ("1", "0"):
+        editor = plugin.get_editor(secret_connection(flags=flags))
+        out = NM.SimpleConnection.new()
+        assert editor.update_connection(out)
+        s_out = out.get_setting_vpn()
+        assert s_out.get_data_item("profile") is None
+        assert s_out.get_data_item("profile-storage") == "secret"
+        assert s_out.get_data_item("profile-flags") == flags
+        assert base64.b64decode(s_out.get_secret("profile")).decode() == PROFILE
+
+
+def test_editor_refuses_to_save_over_a_profile_it_could_not_read(plugin):
+    editor = plugin.get_editor(secret_connection(with_secret=False))
+    out = NM.SimpleConnection.new()
+    with pytest.raises(gi.repository.GLib.Error):
+        editor.update_connection(out)
+    # Nothing was written: the stored profile is still the one in the keyring.
+    assert out.get_setting_vpn() is None
+
+
+def test_editor_explains_an_unavailable_profile(plugin):
+    editor = plugin.get_editor(secret_connection(with_secret=False))
+    text = " ".join(labels(editor.get_widget()))
+    assert "secret" in text.lower() or "keyring" in text.lower()
+
+
+def test_editor_leaves_legacy_connections_alone(plugin):
+    editor = plugin.get_editor(connection())
+    out = NM.SimpleConnection.new()
+    assert editor.update_connection(out)
+    s_out = out.get_setting_vpn()
+    assert base64.b64decode(s_out.get_data_item("profile")).decode() == PROFILE
+    assert s_out.get_data_item("profile-storage") is None
+    assert s_out.get_secret("profile") is None
+
+
+def test_editor_never_reads_a_profile_in_an_unknown_layout(plugin):
+    con = connection()  # has a legacy profile data item
+    con.get_setting_vpn().add_data_item("profile-storage", "v2-whatever")
+    editor = plugin.get_editor(con)
+    assert "vpn.example.net" not in labels(editor.get_widget())
+    with pytest.raises(gi.repository.GLib.Error):
+        editor.update_connection(NM.SimpleConnection.new())
+
+
+def test_editor_reads_absent_flags_as_system_storage(plugin):
+    # NetworkManager reads a secret without flags as NONE; keeping the profile
+    # as AgentOwned here would move an unattended connection into a wallet.
+    con = secret_connection(flags="1")
+    con.get_setting_vpn().remove_data_item("profile-flags")
+    editor = plugin.get_editor(con)
+    out = NM.SimpleConnection.new()
+    assert editor.update_connection(out)
+    assert out.get_setting_vpn().get_data_item("profile-flags") == "0"
+
+
+def test_editor_explains_an_unknown_layout(plugin):
+    con = connection()
+    con.get_setting_vpn().add_data_item("profile-storage", "v2-whatever")
+    editor = plugin.get_editor(con)
+    assert "v2-whatever" in " ".join(labels(editor.get_widget()))
+
+
+@pytest.mark.parametrize("flags", ["2", "4", "6", "garbage", "", "-1"])
+def test_editor_refuses_flags_that_would_never_store_the_profile(plugin, flags):
+    # The old code passed these straight to a g_return_if_fail(), which left
+    # the new setting without any profile at all and still reported success,
+    # so saving silently threw the connection's profile away.
+    editor = plugin.get_editor(secret_connection(flags=flags))
+    out = NM.SimpleConnection.new()
+    with pytest.raises(gi.repository.GLib.Error):
+        editor.update_connection(out)
+    assert out.get_setting_vpn() is None
+
+
+def test_editor_explains_flags_that_would_never_store_the_profile(plugin):
+    editor = plugin.get_editor(secret_connection(flags="2"))
+    assert "profile-flags" in " ".join(labels(editor.get_widget()))
+
+
+def test_editor_shows_a_remote_kept_in_a_connection_block(plugin):
+    con = connection()
+    con.get_setting_vpn().add_data_item("profile", base64.b64encode(
+        b"client\n<connection>\nremote vpn.example.net 1194 udp\n"
+        b"auth-user-pass\n</connection>\n").decode())
+    editor = plugin.get_editor(con)
+    widget = editor.get_widget()
+    assert "vpn.example.net" in labels(widget)
+    user, password, _cert_pass = entries(widget)
+    assert user.get_visible() and password.get_visible()
+    assert editor.update_connection(NM.SimpleConnection.new())
+
+
+def test_editor_still_saves_a_connection_whose_flags_are_fine(plugin):
+    # The refusal above must be about the flags, not about secret mode.
+    editor = plugin.get_editor(secret_connection(flags="0"))
+    out = NM.SimpleConnection.new()
+    assert editor.update_connection(out)
+    assert out.get_setting_vpn().get_data_item("profile-flags") == "0"

@@ -2,8 +2,12 @@
 """Minimal inspection of OpenVPN profile text.
 
 The profile stored in the NetworkManager connection is already normalized by
-the import code: every file reference is inlined and inline credentials are
-moved into the connection's username/password.
+the import code: every file reference is inlined, inline credentials are
+moved into the connection's username/password, and comments are gone.
+
+Comment lines are still skipped below.  A connection written by an older
+build of this plugin still has them, and this only reads profiles -- being
+able to read one is not a reason to rewrite it.
 """
 
 import shlex

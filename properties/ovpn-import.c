@@ -6,10 +6,15 @@
  * profile is inlined.  Credentials are taken out of the profile and stored
  * in the connection instead: the username as data, the password as secret.
  *
- * Normalizing means inlining files and moving credentials out, nothing else:
- * directive order, repeated directives, quoting, comments and directives this
- * code has never heard of all come out the way they went in.  There is no
- * list of allowed directives anywhere.
+ * Normalizing means inlining files, moving credentials out and dropping
+ * comments, nothing else: directive order, repeated directives, blank lines,
+ * quoting and directives this code has never heard of all come out the way
+ * they went in.  There is no list of allowed directives anywhere.
+ *
+ * Comments go because openvpn3 ignores them and the profile inside a
+ * connection is not a file anybody opens in an editor any more: a client that
+ * shows it as a table of entries would only have rows nothing can act on.
+ * See comment_start() for which '#' and ';' count as one.
  */
 
 #include "ovpn-import.h"
@@ -44,6 +49,129 @@ openvpn3_profile_free(Openvpn3Profile *p)
     }
     g_free(p->remote);
     g_free(p);
+}
+
+/* Where the comment on a directive line starts, or -1 if it has none.
+ *
+ * The two OpenVPN lexers do not agree on this, so what is removed is what
+ * both of them read as a comment:
+ *
+ *  - OpenVPN 2 (parse_line(), src/openvpn/options_parse.c) only looks for a
+ *    '#' or ';' in STATE_INITIAL, that is at the start of a parameter, and
+ *    not inside quotes.  "a#b" is the literal value a#b.
+ *  - openvpn3 (OptionList::LexComment, openvpn/common/options.hpp) looks
+ *    anywhere outside quotes, but lets a backslash escape the character:
+ *    "a#b" is the value "a", and "\#" is a literal '#'.
+ *
+ * So a '#' or ';' is a comment here only when it is unquoted, unescaped and
+ * starts a word.  Where the two disagree -- a character glued to the middle
+ * of a word, an escaped one -- the line is left alone: openvpn3 is the one
+ * that reads the stored profile, and it already ignores whatever it considers
+ * a comment, so keeping those characters cannot change what the option means
+ * while truncating them could.
+ *
+ * "Unquoted" has to satisfy both of them as well, and the two do not even
+ * agree on where a quote ends: a backslash inside single quotes is a literal
+ * character for OpenVPN 2 (parse_line() skips its escape handling in
+ * STATE_READING_SQUOTED_PARM), so the apostrophe after it closes the quote,
+ * while openvpn3 lets it escape that apostrophe and stays inside.  Both quote
+ * states are therefore tracked, and a character counts as unquoted only when
+ * neither lexer has it in a quote.  That keeps "setenv a 'x\' # literal'"
+ * whole, which is the value openvpn3 reads.
+ */
+static gssize
+comment_start(const char *line)
+{
+    gboolean ov2_squote = FALSE, ov2_dquote = FALSE, ov2_escaped = FALSE;
+    gboolean ov3_squote = FALSE, ov3_dquote = FALSE, ov3_escaped = FALSE;
+    gboolean word_start = TRUE;
+    const char *s;
+
+    for (s = line; *s; s++) {
+        const gboolean quoted  = ov2_squote || ov2_dquote || ov3_squote || ov3_dquote;
+        const gboolean escaped = ov2_escaped || ov3_escaped;
+
+        if (word_start && !quoted && !escaped && (*s == '#' || *s == ';'))
+            return s - line;
+
+        /* OpenVPN 2: a backslash is not an escape inside single quotes. */
+        if (ov2_escaped)
+            ov2_escaped = FALSE;
+        else if (*s == '\\' && !ov2_squote)
+            ov2_escaped = TRUE;
+        else if (*s == '"' && !ov2_squote)
+            ov2_dquote = !ov2_dquote;
+        else if (*s == '\'' && !ov2_dquote)
+            ov2_squote = !ov2_squote;
+
+        /* openvpn3: a backslash escapes everywhere, quotes included. */
+        if (ov3_escaped)
+            ov3_escaped = FALSE;
+        else if (*s == '\\')
+            ov3_escaped = TRUE;
+        else if (*s == '"' && !ov3_squote)
+            ov3_dquote = !ov3_dquote;
+        else if (*s == '\'' && !ov3_dquote)
+            ov3_squote = !ov3_squote;
+
+        /* Only unquoted, unescaped whitespace starts the next word. */
+        word_start = !quoted && !escaped && g_ascii_isspace(*s);
+    }
+    return -1;
+}
+
+/* Cuts the trailing whitespace a removed comment was separated by, and no
+ * more: backslash-escaped whitespace is part of the value in front of it for
+ * both lexers ("setenv a value\  # c" is the value "value "), so only the
+ * unescaped run at the end goes.  An even number of backslashes before it are
+ * escaped backslashes and leave the whitespace a separator again. */
+static void
+chomp_separators(char *line)
+{
+    gsize len = strlen(line);
+
+    while (len > 0 && g_ascii_isspace(line[len - 1])) {
+        gsize backslashes = 0;
+
+        while (backslashes < len - 1 && line[len - 2 - backslashes] == '\\')
+            backslashes++;
+        if (backslashes % 2)
+            break;
+        len--;
+    }
+    line[len] = '\0';
+}
+
+/* A directive line as the lexers see it: the leading separators and the CRLF
+ * terminator go, and so does the trailing separator run -- but not whitespace
+ * a backslash escaped, which is part of the value in front of it.
+ *
+ * This is the trimming every line goes through before anything looks at it,
+ * so it is also where an escaped trailing space written out by an earlier
+ * normalization has to survive: the stored profile is parsed again on export,
+ * on reimport and whenever the editor hands one back for inlining, and a
+ * plain strip would turn "setenv a value\ " into a bare backslash before the
+ * newline on the very next pass. */
+static char *
+strip_separators(char *line)
+{
+    gsize len;
+
+    g_strchug(line);
+    len = strlen(line);
+    /* The line terminator is not part of the line, escaped or not. */
+    if (len > 0 && line[len - 1] == '\r')
+        line[--len] = '\0';
+    chomp_separators(line);
+    return line;
+}
+
+/* "</tag>" on a line of its own, the only thing openvpn3 closes a block
+ * with. */
+static gboolean
+is_closing_tag(const char *line)
+{
+    return strlen(line) > 3 && line[0] == '<' && line[1] == '/' && g_str_has_suffix(line, ">");
 }
 
 /* Splits a directive line into words, honouring double and single quotes. */
@@ -156,14 +284,14 @@ openvpn3_profile_parse(const char *text, const char *base_dir, GError **error)
     gboolean has_remote          = FALSE;
 
     for (char **l = lines; *l; l++) {
-        g_autofree char *line = g_strstrip(g_strdup(*l));
+        g_autofree char *line = strip_separators(g_strdup(*l));
         g_auto(GStrv) words   = NULL;
         const char *name;
 
         /* The empty piece after the final newline is not a line. */
         if (!l[1] && !**l)
             break;
-        /* Tolerate CRLF files: g_strstrip removed the \r above. */
+        /* Tolerate CRLF files: strip_separators removed the \r above. */
         if (inline_tag) {
             g_autofree char *end = g_strdup_printf("</%s>", inline_tag);
             if (g_str_equal(line, end)) {
@@ -184,7 +312,12 @@ openvpn3_profile_parse(const char *text, const char *base_dir, GError **error)
             }
             continue;
         }
-        /* The option scope we are in ends here. */
+        /* The option scope we are in ends here.  Matched before the comment
+         * is taken off, because openvpn3 matches every closing tag against
+         * the raw line: "</connection> # done" leaves the block open for it,
+         * so it has to leave it open here too rather than let this import
+         * store a profile openvpn3 will refuse.  The closing tag of an
+         * opaque <tag> is matched the same way, in the block above. */
         if (scope) {
             g_autofree char *end = g_strdup_printf("</%s>", scope);
 
@@ -192,6 +325,37 @@ openvpn3_profile_parse(const char *text, const char *base_dir, GError **error)
                 g_clear_pointer(&scope, g_free);
                 g_string_append_printf(out, "%s\n", line);
                 continue;
+            }
+        }
+        /* Everything left is a directive, so a comment on it is a comment --
+         * and a line that is nothing but one goes away entirely.  A blank
+         * line is not a comment and stays.  The lines of an inline <tag> are
+         * payload and were handled above without ever coming here. */
+        {
+            gssize cut = comment_start(line);
+
+            if (cut >= 0) {
+                char *kept = g_strndup(line, cut);
+
+                chomp_separators(kept);
+                /* Cutting a comment must not turn a line into a closing tag
+                 * the raw line was not one: openvpn3 matches every closing
+                 * tag against the raw line, so "</connection> # x" is no
+                 * boundary for it even when a real closer follows below.
+                 * Emitting the cut line would invent one there, push every
+                 * directive up to the real closer out of the scope and leave
+                 * the profile with a closing tag too many.  Such a line is
+                 * passed through exactly as it came instead -- the comment
+                 * stays, and openvpn3 ignores it where it stands. */
+                if (is_closing_tag(kept)) {
+                    g_free(kept);
+                } else if (!*kept) {
+                    g_free(kept);
+                    continue;
+                } else {
+                    g_free(line);
+                    line = kept;
+                }
             }
         }
         {

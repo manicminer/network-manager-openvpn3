@@ -414,3 +414,331 @@ def test_a_failed_export_leaves_nothing_behind(plugin, tmp_path):
     with pytest.raises(GLib.Error):
         plugin.export(str(d / "missing" / "out.ovpn"), con)
     assert list(d.iterdir()) == []
+
+
+# -- comments are dropped on import -------------------------------------------
+#
+# openvpn3 ignores comments, and the profile inside a connection is no longer a
+# file anybody opens in an editor, so carrying them over only clutters the
+# clients that show the profile as a table of entries.  What counts as a
+# comment is what OpenVPN 2 and openvpn3 agree is one; see comment_start() in
+# properties/ovpn-import.c for the two lexers this follows.
+
+
+def test_full_line_comments_are_dropped(plugin, tmp_path):
+    path = write(tmp_path, "c.ovpn",
+                 "# a hash comment\n"
+                 "client\n"
+                 "; a semicolon comment\n"
+                 "    # an indented comment\n"
+                 "remote vpn.example.net 1194\n")
+    _, config = vpn(plugin.import_(path))
+    assert config == "client\nremote vpn.example.net 1194\n"
+
+
+def test_inline_comments_are_dropped(plugin, tmp_path):
+    path = write(tmp_path, "c.ovpn",
+                 "client\n"
+                 "remote vpn.example.net 1194 # the main one\n"
+                 "dev tun\t; and one after a tab\n")
+    _, config = vpn(plugin.import_(path))
+    assert config == "client\nremote vpn.example.net 1194\ndev tun\n"
+
+
+def test_blank_lines_and_the_order_of_what_is_left_survive(plugin, tmp_path):
+    # Blank lines are not comments, and nothing is sorted or deduplicated.
+    path = write(tmp_path, "c.ovpn",
+                 "client\n"
+                 "\n"
+                 "# first\n"
+                 "remote b.example.net\n"
+                 "remote a.example.net\n"
+                 "remote b.example.net\n"
+                 "\n"
+                 "some-directive-we-have-never-heard-of 1 2 3 # why not\n")
+    _, config = vpn(plugin.import_(path))
+    assert config == ("client\n"
+                      "\n"
+                      "remote b.example.net\n"
+                      "remote a.example.net\n"
+                      "remote b.example.net\n"
+                      "\n"
+                      "some-directive-we-have-never-heard-of 1 2 3\n")
+
+
+def test_comments_inside_a_connection_block_are_dropped(plugin, tmp_path):
+    # <connection> is a scope of options, so its lines are directives and the
+    # comments among them are comments.
+    path = write(tmp_path, "c.ovpn",
+                 "client\n"
+                 "<connection>\n"
+                 "# the failover entry\n"
+                 "remote fallback.example.net 1194 udp # via the proxy\n"
+                 "http-proxy proxy.example.net 8080\n"
+                 "</connection>\n")
+    _, config = vpn(plugin.import_(path))
+    assert config == ("client\n"
+                      "<connection>\n"
+                      "remote fallback.example.net 1194 udp\n"
+                      "http-proxy proxy.example.net 8080\n"
+                      "</connection>\n")
+
+
+def test_a_quoted_or_escaped_hash_is_a_value_not_a_comment(plugin, tmp_path):
+    # Truncating any of these would silently change what the option means.
+    path = write(tmp_path, "c.ovpn",
+                 "client\n"
+                 "remote vpn.example.net\n"
+                 'setenv a "# inside double quotes"\n'
+                 "setenv b '; inside single quotes'\n"
+                 "setenv c value#glued-to-a-word\n"
+                 "setenv d \\#escaped\n")
+    _, config = vpn(plugin.import_(path))
+    assert 'setenv a "# inside double quotes"\n' in config
+    assert "setenv b '; inside single quotes'\n" in config
+    assert "setenv c value#glued-to-a-word\n" in config
+    assert "setenv d \\#escaped\n" in config
+
+
+def test_opaque_block_payloads_are_never_touched(plugin, tmp_path):
+    # A certificate, a key or an unknown payload is content, not directives:
+    # a '#' in there is part of the data.
+    body = ("-----BEGIN CERTIFICATE-----\n"
+            "# not a comment, just base64 that looks like one\n"
+            "A;B#C\n"
+            "-----END CERTIFICATE-----\n")
+    path = write(tmp_path, "c.ovpn",
+                 "client\nremote vpn.example.net\n"
+                 f"<ca>\n{body}</ca>\n"
+                 "<some-future-payload>\n# kept\n</some-future-payload>\n")
+    _, config = vpn(plugin.import_(path))
+    assert f"<ca>\n{body}</ca>\n" in config
+    assert "<some-future-payload>\n# kept\n</some-future-payload>\n" in config
+
+
+def test_private_key_material_is_byte_for_byte(plugin, tmp_path):
+    from pkihelp import pem_key
+    key = pem_key()
+    path = write(tmp_path, "c.ovpn",
+                 "client\nremote vpn.example.net # here\n"
+                 f"<key>\n{key}</key>\n")
+    _, config = vpn(plugin.import_(path))
+    assert f"<key>\n{key}</key>\n" in config
+
+
+def test_a_password_that_looks_like_a_comment_survives(plugin, tmp_path):
+    path = write(tmp_path, "c.ovpn",
+                 "client\nremote vpn.example.net\n"
+                 "<auth-user-pass>\nalice\n#hunter2 ; really\n</auth-user-pass>\n")
+    s, config = vpn(plugin.import_(path))
+    assert s.get_data_item("username") == "alice"
+    assert s.get_secret("password") == "#hunter2 ; really"
+    assert config == "client\nremote vpn.example.net\nauth-user-pass\n"
+
+
+def test_a_credentials_file_whose_password_looks_like_a_comment_survives(plugin, tmp_path):
+    write(tmp_path, "creds.txt", "alice\n; not a comment\n")
+    path = write(tmp_path, "c.ovpn",
+                 "client\nremote vpn.example.net\nauth-user-pass creds.txt # read at import\n")
+    s, config = vpn(plugin.import_(path))
+    assert s.get_secret("password") == "; not a comment"
+    assert config == "client\nremote vpn.example.net\nauth-user-pass\n"
+
+
+def test_crlf_and_a_missing_final_newline(plugin, tmp_path):
+    path = write(tmp_path, "c.ovpn",
+                 "# intro\r\nclient\r\nremote vpn.example.net # here\r\ndev tun")
+    _, config = vpn(plugin.import_(path))
+    assert config == "client\nremote vpn.example.net\ndev tun\n"
+
+
+def test_a_comment_only_profile_is_still_refused(plugin, tmp_path):
+    path = write(tmp_path, "c.ovpn", "# client\n; remote vpn.example.net\n")
+    with pytest.raises(GLib.Error, match="Not an OpenVPN client profile"):
+        plugin.import_(path)
+
+
+def test_a_comment_cannot_close_an_inline_block(plugin, tmp_path):
+    # openvpn3 matches a closing tag against the raw line, so "</ca> # done"
+    # does not close <ca> for it either.  Refusing the profile is the only
+    # honest answer: the alternative is storing one openvpn3 will not load.
+    path = write(tmp_path, "c.ovpn",
+                 f"client\nremote vpn.example.net\n<ca>\n{PEM}</ca> # done\n")
+    with pytest.raises(GLib.Error, match="Unterminated"):
+        plugin.import_(path)
+
+
+def test_a_comment_cannot_close_a_connection_scope(plugin, tmp_path):
+    # <connection> is a scope for the directives inside it, but it is still a
+    # block, and openvpn3 matches every closing tag against the raw line.  A
+    # comment after one leaves the block open for openvpn3, so it has to leave
+    # it open here too rather than store a profile openvpn3 will not load.
+    path = write(tmp_path, "c.ovpn",
+                 "client\n<connection>\nremote vpn.example.net 1194\n</connection> # done\n")
+    with pytest.raises(GLib.Error, match="Unterminated"):
+        plugin.import_(path)
+
+
+def test_a_comment_on_a_tag_line_is_dropped_and_the_tag_still_opens(plugin, tmp_path):
+    # openvpn3 strips the comment before deciding whether the line is a tag.
+    path = write(tmp_path, "c.ovpn",
+                 f"client\nremote vpn.example.net\n<ca> # the CA\n{PEM}</ca>\n")
+    _, config = vpn(plugin.import_(path))
+    assert config == f"client\nremote vpn.example.net\n<ca>\n{PEM}</ca>\n"
+
+
+def test_a_commented_profile_survives_an_export_and_reimport(plugin, tmp_path):
+    # Export writes the stored profile out as it stands, so what import left
+    # is what a second import gets: dropping comments has to be idempotent.
+    path = write(tmp_path, "c.ovpn",
+                 "# intro\nclient\nremote vpn.example.net 1194 # the main one\n"
+                 f"<ca>\n{PEM}</ca>\n")
+    first = vpn(plugin.import_(path))[1]
+    assert "#" not in first.replace(PEM, "")
+    out = str(tmp_path / "out.ovpn")
+    assert plugin.export(out, plugin.import_(path))
+    assert open(out).read() == first
+    assert vpn(plugin.import_(out))[1] == first
+
+
+def test_an_escaped_apostrophe_inside_single_quotes_is_not_a_comment(plugin, tmp_path):
+    # The one place the two lexers part company over quoting: openvpn3 lets a
+    # backslash escape the apostrophe and stays inside the single quote, so
+    # the hash is part of the value, while OpenVPN 2 does not escape inside
+    # single quotes, so for it the quote ends there and a comment follows.
+    # They disagree, so nothing is cut -- cutting would destroy the value
+    # openvpn3, the one that reads the stored profile, sees.
+    path = write(tmp_path, "c.ovpn",
+                 "client\n"
+                 "remote vpn.example.net\n"
+                 "setenv a 'x\\' # literal'\n"
+                 "setenv b 'y\\' ; literal'\n"
+                 "<connection>\n"
+                 "remote fallback.example.net\n"
+                 "setenv c 'z\\' # literal'\n"
+                 "</connection>\n")
+    _, config = vpn(plugin.import_(path))
+    assert "setenv a 'x\\' # literal'\n" in config
+    assert "setenv b 'y\\' ; literal'\n" in config
+    assert "setenv c 'z\\' # literal'\n" in config
+
+
+def test_escaped_whitespace_before_a_comment_is_part_of_the_value(plugin, tmp_path):
+    # "value\ " is a value with a space on its end for both lexers; only the
+    # unescaped whitespace after it separates the comment.  Trimming both
+    # would change the value and leave a dangling backslash behind.
+    path = write(tmp_path, "c.ovpn",
+                 "client\n"
+                 "remote vpn.example.net\n"
+                 "setenv a value\\  # the comment\n"
+                 "setenv b other\\\t\t; the comment\n"
+                 "<connection>\n"
+                 "remote fallback.example.net\n"
+                 "setenv c inner\\  # the comment\n"
+                 "</connection>\n")
+    _, config = vpn(plugin.import_(path))
+    assert "setenv a value\\ \n" in config
+    assert "setenv b other\\\t\n" in config
+    assert "setenv c inner\\ \n" in config
+    assert "#" not in config and ";" not in config
+
+
+def test_an_escaped_backslash_before_a_comment_is_not_an_escape(plugin, tmp_path):
+    # Two backslashes are one literal backslash, so the whitespace after them
+    # is a separator again and goes with the comment.
+    path = write(tmp_path, "c.ovpn",
+                 "client\n"
+                 "remote vpn.example.net\n"
+                 "setenv a value\\\\ # the comment\n")
+    _, config = vpn(plugin.import_(path))
+    assert "setenv a value\\\\\n" in config
+
+
+def test_escaped_trailing_whitespace_survives_an_export_and_reimport(plugin, tmp_path):
+    # The first pass leaves "setenv a value\ " -- a value with a space on its
+    # end.  Every later pass trims the line it reads before anything else, so
+    # that is where the escape has to be honoured too: otherwise the second
+    # import hands openvpn3 a bare backslash before the newline.
+    path = write(tmp_path, "c.ovpn",
+                 "client\n"
+                 "remote vpn.example.net\n"
+                 "setenv a value\\  # the comment\n"
+                 "setenv b other\\\t\t; the comment\n"
+                 "<connection>\n"
+                 "remote fallback.example.net\n"
+                 "setenv c inner\\  # the comment\n"
+                 "</connection>\n")
+    first = vpn(plugin.import_(path))[1]
+    assert "setenv a value\\ \n" in first
+
+    out = str(tmp_path / "out.ovpn")
+    assert plugin.export(out, plugin.import_(path))
+    assert open(out).read() == first
+    second = vpn(plugin.import_(out))[1]
+    assert second == first
+    assert "setenv a value\\ \n" in second
+    assert "setenv b other\\\t\n" in second
+    assert "setenv c inner\\ \n" in second
+    assert "setenv a value\\\n" not in second
+
+
+def test_unicode_whitespace_in_a_value_is_not_a_separator(plugin, tmp_path):
+    # A directive line separates its words with ASCII whitespace; U+00A0 and
+    # the other Unicode separators are literal bytes of the value in front of
+    # them.  So the separator run a comment is cut with stops at one, and one
+    # cannot start the word a comment has to begin.
+    path = write(tmp_path, "c.ovpn",
+                 "client\n"
+                 "remote vpn.example.net\n"
+                 "setenv a value  # the comment\n"
+                 "setenv b value  ; the comment\n"
+                 "setenv c value # not a comment\n")
+    first = vpn(plugin.import_(path))[1]
+    assert "setenv a value \n" in first
+    assert "setenv b value \n" in first
+    assert "setenv c value # not a comment\n" in first
+    # And a second pass changes nothing more.
+    out = str(tmp_path / "out.ovpn")
+    assert plugin.export(out, plugin.import_(path))
+    assert vpn(plugin.import_(out))[1] == first
+
+
+def test_a_commented_closing_tag_does_not_become_a_scope_boundary(plugin, tmp_path):
+    # openvpn3 matches every closing tag against the raw line, so this line is
+    # not a boundary for it and the scope runs on to the real closer below.
+    # Cutting the comment off would emit a boundary openvpn3 does not see and
+    # push "remote b" out of the scope -- on a profile that would then no
+    # longer balance.  The line is kept exactly as it came instead.
+    path = write(tmp_path, "c.ovpn",
+                 "client\n"
+                 "<connection>\n"
+                 "remote a.example.net\n"
+                 "</connection> # not a closer\n"
+                 "remote b.example.net\n"
+                 "</connection>\n")
+    first = vpn(plugin.import_(path))[1]
+    assert first == ("client\n"
+                     "<connection>\n"
+                     "remote a.example.net\n"
+                     "</connection> # not a closer\n"
+                     "remote b.example.net\n"
+                     "</connection>\n")
+    # Exactly one scope, and "remote b" is still inside it.
+    assert first.count("<connection>\n") == 1
+    assert first.count("</connection>\n") == 1
+    # A second pass changes nothing more.
+    out = str(tmp_path / "out.ovpn")
+    assert plugin.export(out, plugin.import_(path))
+    assert vpn(plugin.import_(out))[1] == first
+
+
+def test_a_commented_closing_tag_at_the_top_level_is_kept(plugin, tmp_path):
+    # The same line with no scope open: still not a closing tag for openvpn3,
+    # so still not turned into one here.
+    path = write(tmp_path, "c.ovpn",
+                 "client\n"
+                 "</connection> ; not a closer\n"
+                 "remote vpn.example.net\n")
+    first = vpn(plugin.import_(path))[1]
+    assert "</connection> ; not a closer\n" in first
+    assert "</connection>\n" not in first

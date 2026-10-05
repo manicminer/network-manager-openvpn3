@@ -3,11 +3,12 @@
 
 The profile stored in the NetworkManager connection is already normalized by
 the import code: every file reference is inlined, inline credentials are
-moved into the connection's username/password, and comments are gone.
+moved into the connection's username/password, and the formatting -- comments
+and blank lines -- is gone.
 
-Comment lines are still skipped below.  A connection written by an older
-build of this plugin still has them, and this only reads profiles -- being
-able to read one is not a reason to rewrite it.
+Blank and comment lines are still skipped below.  A connection written by an
+older build of this plugin still has them, and this only reads profiles --
+being able to read one is not a reason to rewrite it.
 """
 
 import shlex

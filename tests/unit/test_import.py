@@ -445,8 +445,8 @@ def test_inline_comments_are_dropped(plugin, tmp_path):
     assert config == "client\nremote vpn.example.net 1194\ndev tun\n"
 
 
-def test_blank_lines_and_the_order_of_what_is_left_survive(plugin, tmp_path):
-    # Blank lines are not comments, and nothing is sorted or deduplicated.
+def test_the_order_of_what_is_left_survives(plugin, tmp_path):
+    # Nothing is sorted or deduplicated; only the formatting goes.
     path = write(tmp_path, "c.ovpn",
                  "client\n"
                  "\n"
@@ -458,11 +458,9 @@ def test_blank_lines_and_the_order_of_what_is_left_survive(plugin, tmp_path):
                  "some-directive-we-have-never-heard-of 1 2 3 # why not\n")
     _, config = vpn(plugin.import_(path))
     assert config == ("client\n"
-                      "\n"
                       "remote b.example.net\n"
                       "remote a.example.net\n"
                       "remote b.example.net\n"
-                      "\n"
                       "some-directive-we-have-never-heard-of 1 2 3\n")
 
 
@@ -742,3 +740,191 @@ def test_a_commented_closing_tag_at_the_top_level_is_kept(plugin, tmp_path):
     first = vpn(plugin.import_(path))[1]
     assert "</connection> ; not a closer\n" in first
     assert "</connection>\n" not in first
+
+
+# -- blank lines are dropped on import ----------------------------------------
+#
+# For the same reason comments are: a line that is only whitespace tells
+# openvpn3 nothing, and the profile inside a connection is not a file whose
+# layout anybody reads any more.  A client that renders it as a table of
+# entries would get a row that means nothing and that no edit can reach.
+#
+# "Blank" is ASCII whitespace only, which is what g_ascii_isspace() -- and
+# openvpn3's own lexer -- counts; see strip_separators() in
+# properties/ovpn-import.c.  The lines of an inline payload are content rather
+# than formatting and are never inspected.
+
+
+def test_blank_lines_are_dropped(plugin, tmp_path):
+    path = write(tmp_path, "c.ovpn",
+                 "\n"
+                 "client\n"
+                 "\n"
+                 "\n"
+                 "remote vpn.example.net 1194\n"
+                 "\n")
+    _, config = vpn(plugin.import_(path))
+    assert config == "client\nremote vpn.example.net 1194\n"
+
+
+def test_whitespace_only_lines_are_dropped(plugin, tmp_path):
+    # A line of ASCII whitespace is formatting whichever characters it is
+    # made of.
+    path = write(tmp_path, "c.ovpn",
+                 "client\n"
+                 "   \n"
+                 "\t\n"
+                 " \t \f \n"
+                 "remote vpn.example.net\n")
+    _, config = vpn(plugin.import_(path))
+    assert config == "client\nremote vpn.example.net\n"
+
+
+def test_a_vertical_tab_is_not_whitespace(plugin, tmp_path):
+    # g_ascii_isspace(), which is what every line here is stripped with, does
+    # not count '\v' -- unlike C's isspace().  So a line of them is a value
+    # rather than formatting and stays, and the editor's own reader has to draw
+    # the line in exactly the same place or the two disagree about which lines
+    # a profile has.
+    path = write(tmp_path, "c.ovpn",
+                 "client\n"
+                 "\v\n"
+                 "remote vpn.example.net\n")
+    _, config = vpn(plugin.import_(path))
+    assert config == "client\n\v\nremote vpn.example.net\n"
+
+
+def test_a_blank_line_is_dropped_whatever_the_comment_around_it(plugin, tmp_path):
+    # A line that is only a comment leaves nothing behind, and the blank line
+    # it sat next to leaves nothing behind either: neither reappears as the
+    # other.
+    path = write(tmp_path, "c.ovpn",
+                 "# intro\n"
+                 "\n"
+                 "client\n"
+                 "   # indented\n"
+                 "\n"
+                 "remote vpn.example.net\t# here\n"
+                 "\n"
+                 "; outro\n")
+    _, config = vpn(plugin.import_(path))
+    assert config == "client\nremote vpn.example.net\n"
+
+
+def test_blank_lines_inside_a_connection_scope_are_dropped(plugin, tmp_path):
+    # <connection> is a scope of options, so its lines are directives and the
+    # blank ones among them are formatting just the same.
+    path = write(tmp_path, "c.ovpn",
+                 "client\n"
+                 "<connection>\n"
+                 "\n"
+                 "remote fallback.example.net 1194 udp\n"
+                 "   \n"
+                 "http-proxy proxy.example.net 8080\n"
+                 "\n"
+                 "</connection>\n")
+    _, config = vpn(plugin.import_(path))
+    assert config == ("client\n"
+                      "<connection>\n"
+                      "remote fallback.example.net 1194 udp\n"
+                      "http-proxy proxy.example.net 8080\n"
+                      "</connection>\n")
+
+
+def test_blank_lines_inside_an_opaque_payload_are_kept(plugin, tmp_path):
+    # A certificate, a key or an unknown payload is content, not formatting:
+    # a blank line in there is a byte of the data, leading and trailing ones
+    # included.
+    body = ("\n"
+            "-----BEGIN CERTIFICATE-----\n"
+            "\n"
+            "MIIBsyntheticTESTDATA\n"
+            "-----END CERTIFICATE-----\n"
+            "\n")
+    path = write(tmp_path, "c.ovpn",
+                 "client\nremote vpn.example.net\n"
+                 f"<ca>\n{body}</ca>\n"
+                 "<some-future-payload>\n\nkept\n   \n</some-future-payload>\n")
+    _, config = vpn(plugin.import_(path))
+    assert f"<ca>\n{body}</ca>\n" in config
+    # The line of spaces is still a line of the payload.  Its trailing
+    # whitespace goes the way every payload line's always has -- g_strchomp,
+    # unchanged by this -- and what is left is the blank line itself.
+    assert "<some-future-payload>\n\nkept\n\n</some-future-payload>\n" in config
+
+
+def test_private_key_material_keeps_its_blank_lines(plugin, tmp_path):
+    from pkihelp import pem_key
+    key = pem_key()
+    path = write(tmp_path, "c.ovpn",
+                 "client\nremote vpn.example.net\n"
+                 f"<key>\n\n{key}\n</key>\n")
+    _, config = vpn(plugin.import_(path))
+    assert f"<key>\n\n{key}\n</key>\n" in config
+
+
+def test_an_empty_password_in_an_inline_credentials_block_survives(plugin, tmp_path):
+    # The blank second line of the block is the password, not formatting: it
+    # has to reach take_credentials() as the empty password it is, rather than
+    # be swallowed so that the line below it becomes the password.
+    path = write(tmp_path, "c.ovpn",
+                 "client\nremote vpn.example.net\n"
+                 "<auth-user-pass>\nalice\n\n</auth-user-pass>\n")
+    s, config = vpn(plugin.import_(path))
+    assert s.get_data_item("username") == "alice"
+    assert s.get_secret("password") is None
+    assert config == "client\nremote vpn.example.net\nauth-user-pass\n"
+
+
+def test_a_unicode_whitespace_only_line_is_not_blank(plugin, tmp_path):
+    # U+00A0 and the other Unicode separators separate nothing for openvpn3,
+    # so a line made of them is a value rather than formatting and stays.
+    path = write(tmp_path, "c.ovpn",
+                 "client\n"
+                 " \n"
+                 "remote vpn.example.net\n")
+    _, config = vpn(plugin.import_(path))
+    assert config == "client\n \nremote vpn.example.net\n"
+
+
+def test_crlf_blank_lines_are_dropped(plugin, tmp_path):
+    path = write(tmp_path, "c.ovpn",
+                 "client\r\n\r\nremote vpn.example.net\r\n \r\ndev tun")
+    _, config = vpn(plugin.import_(path))
+    assert config == "client\nremote vpn.example.net\ndev tun\n"
+
+
+def test_a_blank_only_profile_is_still_refused(plugin, tmp_path):
+    path = write(tmp_path, "c.ovpn", "\n   \n\t\n\n")
+    with pytest.raises(GLib.Error, match="Not an OpenVPN client profile"):
+        plugin.import_(path)
+
+
+def test_a_blank_line_cannot_close_a_block(plugin, tmp_path):
+    # Dropping blank lines must not reach into an unterminated payload and
+    # make it look closed: the profile is still refused.
+    path = write(tmp_path, "c.ovpn",
+                 f"client\nremote vpn.example.net\n<ca>\n{PEM}\n\n")
+    with pytest.raises(GLib.Error, match="Unterminated"):
+        plugin.import_(path)
+
+
+def test_a_profile_with_blank_lines_survives_an_export_and_reimport(plugin, tmp_path):
+    # Export writes the stored profile out as it stands, so what import left is
+    # what a second import gets: dropping blank lines has to be idempotent,
+    # including inside a scope and around an opaque payload.
+    path = write(tmp_path, "c.ovpn",
+                 "\nclient\n\nremote vpn.example.net 1194\n\n"
+                 "<connection>\n\nremote fallback.example.net\n\n</connection>\n"
+                 f"<ca>\n\n{PEM}\n</ca>\n\n")
+    first = vpn(plugin.import_(path))[1]
+    assert first == ("client\n"
+                     "remote vpn.example.net 1194\n"
+                     "<connection>\n"
+                     "remote fallback.example.net\n"
+                     "</connection>\n"
+                     f"<ca>\n\n{PEM}\n</ca>\n")
+    out = str(tmp_path / "out.ovpn")
+    assert plugin.export(out, plugin.import_(path))
+    assert open(out).read() == first
+    assert vpn(plugin.import_(out))[1] == first

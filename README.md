@@ -85,16 +85,21 @@ After that the connection is in the VPN menu of Quick Settings.
   references inside `<connection>` blocks, which are a scope of options and
   not an opaque payload: a profile whose only `remote` lives in one imports
   normally. Directive order, repeated directives, repeated `<connection>`
-  blocks, blank lines, quoting and directives this plugin has never heard of
-  are all preserved — there is no list of allowed directives.
-- Comments are dropped at import. openvpn3 ignores them, and the profile in a
-  connection is no longer a file anybody opens in an editor, so a client that
-  shows it as a table of entries would only get rows nothing can act on. A
-  `#` or `;` counts as a comment when it is unquoted, unescaped and starts a
-  word — what OpenVPN 2's `parse_line()` and openvpn3's `LexComment` agree
-  on. A quoted, escaped or word-internal one is a value and stays, and the
-  lines of an inline payload (`<ca>`, `<key>`, `<auth-user-pass>`, an unknown
-  `<tag>`) are content rather than directives and are never touched.
+  blocks, quoting and directives this plugin has never heard of are all
+  preserved — there is no list of allowed directives.
+- Formatting — comments and blank lines — is dropped at import. openvpn3 reads
+  nothing from it, and the profile in a connection is no longer a file anybody
+  opens in an editor, so a client that shows it as a table of entries would
+  only get rows nothing can act on. A `#` or `;` counts as a comment when it is
+  unquoted, unescaped and starts a word — what OpenVPN 2's `parse_line()` and
+  openvpn3's `LexComment` agree on. A quoted, escaped or word-internal one is a
+  value and stays. A line counts as blank when `g_ascii_isspace()` — what this
+  code strips every line with — is all it holds, so a line of `U+00A0` is a
+  value and stays, and so is one of `\v`, which GLib does not count as
+  whitespace even though C's `isspace()` does. The lines of an inline payload
+  (`<ca>`, `<key>`, `<auth-user-pass>`, an unknown `<tag>`) are content rather
+  than directives and are never touched: a blank line inside a certificate, or
+  an empty password, is kept.
 - Credentials in the profile (an inline `<auth-user-pass>` block or the file
   it points to) move into the connection: the username as data, the password
   as a NetworkManager secret. Without them the password is agent-owned: GNOME

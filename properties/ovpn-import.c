@@ -6,15 +6,21 @@
  * profile is inlined.  Credentials are taken out of the profile and stored
  * in the connection instead: the username as data, the password as secret.
  *
- * Normalizing means inlining files, moving credentials out and dropping
- * comments, nothing else: directive order, repeated directives, blank lines,
- * quoting and directives this code has never heard of all come out the way
- * they went in.  There is no list of allowed directives anywhere.
+ * Normalizing means inlining files, moving credentials out and dropping the
+ * formatting -- comments and blank lines -- nothing else: directive order,
+ * repeated directives, quoting and directives this code has never heard of all
+ * come out the way they went in.  There is no list of allowed directives
+ * anywhere.
  *
- * Comments go because openvpn3 ignores them and the profile inside a
- * connection is not a file anybody opens in an editor any more: a client that
- * shows it as a table of entries would only have rows nothing can act on.
- * See comment_start() for which '#' and ';' count as one.
+ * The formatting goes because openvpn3 reads nothing from it and the profile
+ * inside a connection is not a file anybody opens in an editor any more: a
+ * client that shows it as a table of entries would only have rows nothing can
+ * act on.  See comment_start() for which '#' and ';' count as a comment, and
+ * strip_separators() for what counts as whitespace.
+ *
+ * Only the directives are read that way.  The lines of an inline payload --
+ * <ca>, <key>, <auth-user-pass>, an unknown <tag> -- are content, so a blank
+ * line in a certificate, or an empty password, is left exactly where it is.
  */
 
 #include "ovpn-import.h"
@@ -327,10 +333,25 @@ openvpn3_profile_parse(const char *text, const char *base_dir, GError **error)
                 continue;
             }
         }
-        /* Everything left is a directive, so a comment on it is a comment --
-         * and a line that is nothing but one goes away entirely.  A blank
-         * line is not a comment and stays.  The lines of an inline <tag> are
-         * payload and were handled above without ever coming here. */
+        /* Everything left is a directive, so a line with nothing on it is
+         * formatting rather than a directive and goes away entirely.  Nothing
+         * reads it: openvpn3 skips it, and a client that shows the profile as
+         * a table of entries would only gain a row no edit can reach.
+         *
+         * strip_separators() took the whitespace off both ends above, so an
+         * empty line here is one that held nothing else.  That is
+         * g_ascii_isspace(), which this file goes by throughout: U+00A0 and
+         * the other Unicode separators are not whitespace, and neither is
+         * '\v', unlike in C's isspace().  A line of either is a value and is
+         * still a directive.
+         *
+         * The lines of an inline <tag> are payload and were handled above
+         * without ever coming here, so a blank line inside a certificate, or
+         * an empty password, is untouched. */
+        if (!*line)
+            continue;
+        /* A comment on a directive is a comment -- and a line that is nothing
+         * but one goes away entirely, like a blank one. */
         {
             gssize cut = comment_start(line);
 
